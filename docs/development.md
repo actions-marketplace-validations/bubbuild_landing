@@ -23,7 +23,7 @@ Write behavior tests for what users see through CLI, HTTP, and workflow outcomes
 
 Assert public fields when they establish what the user observes, such as a result, gate decision, cancellation, or published comment location. Avoid assertions about helper structure, event positions, exception class names, raw database rows, provider option spelling, or other incidental details. Do not repeat the upstream SDK's query, chunking, or parameter-translation tests. Straightforward glue can be inspected directly and accepted through a real workflow run. Adding a test merely because a file changed does not improve the contract.
 
-The test suite replaces external model requests with deterministic responses; the SDK loop, tools, SQLite, shell checks, and local HTTP transport execute normally. GitHub behavior tests use a local platform emulator. Real workflow runs establish downstream delivery and model quality.
+The test suite replaces external model requests with deterministic responses; the SDK loop, tools, SQLite, shell checks, and local HTTP transport execute normally. GitHub behavior tests use a local platform emulator and isolate the runner's GitHub environment; native event cases supply their own identity and repository inputs. Real workflow runs establish downstream delivery and model quality.
 
 ## Run the continuous loop
 
@@ -36,6 +36,8 @@ The test suite replaces external model requests with deterministic responses; th
 | Release completion | Issuer follows relevant failure or recovery evidence from that release. | Update matching issues only for useful changes; unchanged issues stay quiet. A build or merged PR is not proof of deployed recovery. |
 
 The reusable Action is `action.yml`; Landing's own workflows call it with `uses: ./` and select independent tool and skill collections through `.github/landing.yml`. The workflows are `.github/workflows/main.yml`, `landing.yml`, and `landing-duty.yml`. See [GitHub setup](guides/github.md) for model configuration, permissions, comment delegation, publication, and workflow-token dispatch. There is no model-driven merge or automatic chain that repairs every finding.
+
+Treat the workflow source, event admission and prepared environment as separate boundaries. Main candidate reviews use repository-native permission checks before agent setup and workflow-level cancellation at candidate arrival. Duty loads the default-branch policy, requires explicit comment commands and validates its release source; delegated work uses a separate native queue. See [GitHub trust](guides/github.md#choose-who-can-delegate) for owner-restricted deployments.
 
 Retain investigation details in execution artifacts. Update the relevant issue or PR when evidence, conditions or outcomes change; do not post repeated status reports. Improve project instructions, tools, code, or meaningful regression cases based on useful observations.
 
