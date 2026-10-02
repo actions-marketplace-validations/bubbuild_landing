@@ -15,7 +15,7 @@ make docs-test
 uv build
 ```
 
-Use `make docs` for preview. Run checks appropriate to the change; native CI owns the full Python 3.12–3.14 matrix, quality, strict documentation build, and container recovery. See [Contributing](https://github.com/PsiACE/landing/blob/main/CONTRIBUTING.md) for discussion and submission.
+Use `make docs` for preview. Run checks appropriate to the change; native CI owns the full Python 3.12–3.14 matrix, quality, strict documentation build, and container recovery. See [Contributing](https://github.com/bubbuild/landing/blob/main/CONTRIBUTING.md) for discussion and submission.
 
 ## Test what people observe
 
@@ -28,6 +28,8 @@ The suite replaces external model requests with deterministic responses while ru
 ## Run the feedback loop
 
 Main checks candidate PRs, then Landing reviews the affected behavior with those conclusions. Default-branch native failures receive triage; healthy checks skip model feedback. Maintainers can delegate explanations, fixes, triage, and reviews through explicit comment commands. Release follow-up uses the triggering release's failure or recovery evidence.
+
+The release workflow also deploys documentation from main on push or manual dispatch. Package publication runs only for a published release; documentation-only runs do not trigger issuer follow-up. Pages artifacts use attempt-specific names so deployment retries select one artifact.
 
 ```text
 Issue or failure -> Delegated work -> Candidate PR -> Native checks
