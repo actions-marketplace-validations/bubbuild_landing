@@ -40,7 +40,11 @@ if "--input" in args:
 elif endpoint.endswith("/permission"):
     print(json.dumps({"permission": state["permission"]}))
 elif "/reviews/" in endpoint:
-    print(json.dumps(state["reviews"][0]))
+    number = int(endpoint.rsplit("/", 1)[-1])
+    print(json.dumps(next(record for record in state["reviews"] if record["id"] == number)))
+elif "/comments/" in endpoint:
+    number = int(endpoint.rsplit("/", 1)[-1])
+    print(json.dumps(next(record for record in state["comments"] if record["id"] == number)))
 elif endpoint.endswith("/reviews") or endpoint.endswith("/comments"):
     kind = endpoint.rsplit("/", 1)[-1]
     for record in state[kind]:
@@ -62,7 +66,7 @@ else:
 def invoke(tmp_path, platform, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
-    def call(event, *, key="delegation", repository="example/landing", prefix="/landing"):
+    def call(event, *, key="delegation", repository="example/landing", prefix="/landing", number=0):
         source = tmp_path / "event.json"
         source.write_text(json.dumps(event))
         return github.main([
@@ -76,6 +80,8 @@ def invoke(tmp_path, platform, monkeypatch):
             str(tmp_path / "landing.sqlite3"),
             "--command-prefix",
             prefix,
+            "--number",
+            str(number),
         ])
 
     return call
@@ -184,10 +190,19 @@ def test_agent_publishes_native_review_with_inline_comment_and_deduplicates(tmp_
 
 def test_owned_inline_followup_retains_mode_and_replies_to_original_thread(platform, invoke, model):
     state = json.loads(platform.read_text())
-    state["reviews"] = [{"id": 9, "body": github.marker("gatekeeper", "earlier") + "\nA retry finding."}]
+    state["reviews"] = [
+        {"id": 9, "body": github.marker("gatekeeper", "earlier") + "\nA retry finding."},
+        {"id": 10, "body": "", "user": {"login": "maintainer"}},
+    ]
     state["target"] = {"title": "Bound retries", "body": "Keep the initial request outside the retry loop."}
     state["comments"] = [
-        {"id": 17, "body": "The loop controls only retry requests.", "path": "retry.py", "line": 7},
+        {
+            "id": 17,
+            "body": "The loop controls only retry requests.",
+            "path": "retry.py",
+            "line": 7,
+            "pull_request_review_id": 9,
+        },
         {"id": 20, "in_reply_to_id": 19, "body": "Unrelated deployment discussion."},
     ]
     platform.write_text(json.dumps(state))
@@ -197,7 +212,7 @@ def test_owned_inline_followup_retains_mode_and_replies_to_original_thread(platf
         "comment": {
             "id": 18,
             "in_reply_to_id": 17,
-            "pull_request_review_id": 9,
+            "pull_request_review_id": 10,
             "body": "Does this affect the initial attempt?",
             "path": "retry.py",
             "line": 7,
@@ -226,6 +241,8 @@ def test_owned_inline_followup_retains_mode_and_replies_to_original_thread(platf
         )
 
     responses.extend([
+        completion(tool="bash", arguments={"command": "gh api repos/example/landing/issues/42"}),
+        completion(tool="bash", arguments={"command": "gh api repos/example/landing/pulls/comments/17"}),
         reply_from_evidence,
         completion(
             tool="bash",
@@ -238,7 +255,7 @@ def test_owned_inline_followup_retains_mode_and_replies_to_original_thread(platf
     assert action.mode == "gatekeeper"
     assert action.status == "completed"
     state = json.loads(platform.read_text())
-    assert len(state["reviews"]) == 1
+    assert len(state["reviews"]) == 2
     assert state["comments"][-1]["in_reply_to_id"] == 17
     assert "initial attempt is unaffected" in state["comments"][-1]["body"]
 
@@ -267,7 +284,7 @@ def test_text_without_required_publication_is_failed_work(tmp_path, platform, mo
 
 
 def test_review_of_superseded_candidate_does_not_report_success(tmp_path, platform, model):
-    responses, _ = model
+    responses, requests = model
     state = json.loads(platform.read_text())
     state["head"] = "new-candidate"
     platform.write_text(json.dumps(state))
@@ -276,16 +293,23 @@ def test_review_of_superseded_candidate_does_not_report_success(tmp_path, platfo
         "event": "COMMENT",
         "body": github.marker("gatekeeper", "superseded") + "\nReviewed the original candidate.",
     }
+
+    async def replace_candidate(**kwargs):
+        state["head"] = "new-candidate"
+        platform.write_text(json.dumps(state))
+        return completion(tool="fs_write", arguments={"path": "review.json", "content": json.dumps(review)})
+
     responses.extend([
-        completion(tool="fs_write", arguments={"path": "review.json", "content": json.dumps(review)}),
+        replace_candidate,
         completion(
             tool="bash", arguments={"command": "gh api repos/example/landing/pulls/42/reviews --input review.json"}
         ),
         completion(tool="decide", arguments={"decision": "allow"}),
         completion("Published the original candidate review."),
     ])
-    action = asyncio.run(
-        github.run(
+
+    async def run():
+        return await github.run(
             "example/landing",
             "gatekeeper",
             "Review the candidate.",
@@ -296,7 +320,141 @@ def test_review_of_superseded_candidate_does_not_report_success(tmp_path, platfo
             key="superseded",
             checks=[],
         )
-    )
+
+    with pytest.raises(ValueError, match="PR head changed"):
+        asyncio.run(run())
+    assert not requests
+    assert not json.loads(platform.read_text())["reviews"]
+    state["head"] = "candidate-head"
+    platform.write_text(json.dumps(state))
+    action = asyncio.run(run())
     assert action.status == "failed"
     assert action.error is not None
     assert "PR head changed" in action.error["message"]
+
+
+def test_release_tag_event_delegates_maintenance(invoke, model):
+    responses, _ = model
+    responses.append(completion("Documentation deployment needs its repository Pages configuration."))
+    action = invoke({
+        "repository": {"full_name": "example/landing", "default_branch": "main"},
+        "workflow_run": {"id": 123, "head_branch": "0.0.0", "event": "release"},
+    })
+    assert action is not None
+    assert action.status == "completed"
+    assert action.mode == "issuer"
+    assert action.result == "Documentation deployment needs its repository Pages configuration."
+
+
+def test_unchanged_followup_completes_with_later_reads_and_remains_idempotent(tmp_path, platform, invoke, model):
+    responses, requests = model
+    (tmp_path / "evidence.txt").write_text("The original response is missing.")
+    response = completion(
+        tool="no_update", arguments={"reason": "The original response is still missing; no new evidence."}
+    )
+    tool_calls = response.choices[0].message.tool_calls
+    assert tool_calls is not None
+    read_calls = completion(tool="fs_read", arguments={"path": "evidence.txt"}).choices[0].message.tool_calls or []
+    read_calls[0].id = "call-read"
+    tool_calls.extend(read_calls)
+    responses.extend([
+        response,
+        completion("No new evidence; the issue remains open."),
+    ])
+    event = {
+        "repository": {"full_name": "example/landing", "default_branch": "main"},
+        "workflow_run": {"id": 123, "head_branch": "main", "event": "push"},
+    }
+    action = invoke(event, key="followup:123", number=42)
+    assert action is not None
+    assert action.status == "completed"
+    assert not json.loads(platform.read_text())["comments"]
+    calls = len(requests)
+    replay = invoke(event, key="followup:123", number=42)
+    assert replay is not None and replay.id == action.id
+    assert replay.status == "completed"
+    assert len(requests) == calls
+    assert not json.loads(platform.read_text())["comments"]
+
+
+def test_explicit_triage_still_requires_the_requested_reply(platform, invoke, model):
+    responses, _ = model
+    responses.extend([
+        completion(tool="no_update", arguments={"reason": "No useful change."}),
+        completion("The issue is unchanged."),
+    ])
+    action = invoke({
+        "repository": {"full_name": "example/landing"},
+        "issue": {"number": 42},
+        "comment": {
+            "body": "/landing triage Check this issue and explain what is still missing.",
+            "user": {"type": "User", "login": "maintainer"},
+        },
+    })
+    assert action is not None
+    assert action.status == "failed"
+    assert not json.loads(platform.read_text())["comments"]
+
+
+def test_changed_followup_publishes_once(platform, invoke, model):
+    responses, _ = model
+    stamp = github.marker("issuer", "followup:124")
+    responses.extend([
+        completion(
+            tool="fs_write",
+            arguments={
+                "path": "update.json",
+                "content": json.dumps({"body": stamp + "\nThe new failure includes the missing diagnostic."}),
+            },
+        ),
+        completion(
+            tool="bash", arguments={"command": "gh api repos/example/landing/issues/42/comments --input update.json"}
+        ),
+        completion("Published the new diagnostic evidence."),
+    ])
+    action = invoke(
+        {
+            "repository": {"full_name": "example/landing", "default_branch": "main"},
+            "workflow_run": {"id": 124, "head_branch": "main", "event": "push"},
+        },
+        key="followup:124",
+        number=42,
+    )
+    assert action is not None
+    assert action.status == "completed"
+    comments = json.loads(platform.read_text())["comments"]
+    assert len(comments) == 1
+    assert "missing diagnostic" in comments[0]["body"]
+
+
+@pytest.mark.parametrize("declare_unchanged", [False, True])
+def test_failed_automatic_publication_is_not_a_quiet_completion(tmp_path, platform, invoke, model, declare_unchanged):
+    responses, _ = model
+    response = completion(
+        tool="bash",
+        arguments={
+            "command": "touch publication-attempted && gh api repos/example/landing/issues/42/comments --input missing.json"
+        },
+    )
+    if declare_unchanged:
+        calls = response.choices[0].message.tool_calls
+        assert calls is not None
+        unchanged = completion(tool="no_update", arguments={"reason": "No useful change."})
+        unchanged_calls = unchanged.choices[0].message.tool_calls or []
+        unchanged_calls[0].id = "call-unchanged"
+        calls.extend(unchanged_calls)
+    responses.extend([
+        response,
+        completion("Published an update."),
+    ])
+    action = invoke(
+        {
+            "repository": {"full_name": "example/landing", "default_branch": "main"},
+            "workflow_run": {"id": 125, "head_branch": "main", "event": "push"},
+        },
+        number=42,
+    )
+    assert action is not None
+    assert action.status == "failed"
+    assert (tmp_path / "publication-attempted").exists()
+    assert not json.loads(platform.read_text())["comments"]

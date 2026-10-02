@@ -8,9 +8,6 @@ on:
   workflow_run:
     workflows: [release-main]
     types: [completed]
-  schedule:
-    - cron: '23 3 * * *'
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,7 +16,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: landing-duty-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.id || 'daily' }}
+  group: landing-duty-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
@@ -56,7 +53,7 @@ jobs:
           git var GIT_AUTHOR_IDENT
           git var GIT_COMMITTER_IDENT
           gh auth setup-git
-      - name: Handle the event or daily maintenance
+      - name: Handle the delegated comment or release event
         uses: ./
         env:
           LANDING_CONFIG: .github/landing.yml
@@ -67,8 +64,13 @@ jobs:
           LANDING_MODEL_TIMEOUT_SECONDS: '120'
         with:
           command: triage
+          checked-revision: ${{ github.event_name != 'workflow_run' && github.sha || '' }}
           delivery-key: ${{ format('duty:{0}', github.event.comment.id || github.run_id) }}
-          instruction: Review default-branch checks, release evidence, and existing maintenance issues using gh. Reuse existing issues; reopen only a real recurrence and close only after verifying their acceptance criteria. Record concrete evidence and acceptance criteria. Do not create work for healthy checks or claim deployment recovery from a build.
+          instruction: >-
+            Follow the triggering release only. Its conclusion is ${{ github.event.workflow_run.conclusion }}.
+            Read affected jobs or deployment evidence through gh. Search for a matching issue only when this event supplies relevant failure or recovery evidence.
+            Update an existing issue only for useful new evidence, changed conditions or verified progress; otherwise complete without a public write.
+            Do not scan unrelated open issues or resolved historical failures. A build does not establish deployed recovery.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
