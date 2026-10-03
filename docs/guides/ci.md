@@ -4,7 +4,7 @@ Let CI prepare the checkout, dependencies, credentials, checks, and skills. Land
 
 ## Prepare execution
 
-Run admission before candidate setup when that setup receives credentials. Use a reviewed Landing revision and trusted workflow source. The Action installs its own isolated runtime, uses your prepared project tools and authenticated gh, and does not install project dependencies or skills. Prepare skills with your existing checkout actions or gh commands, then select them with `LANDING_SKILL_DIRS`.
+Run admission before candidate setup when that setup receives credentials. Use a reviewed Landing revision and trusted workflow source. The Action installs its own isolated runtime, uses your prepared project tools and authenticated gh, and does not install project dependencies or skills. Prepare skills with your existing checkout actions or gh commands, then add their discovery roots with `LANDING_SKILL_DIRS`. To restrict available skills, configure the mode's `allowed_skills`; see [Mode capabilities](../reference/configuration.md#mode-capabilities).
 
 Start with explanation or advisory review. Keep required native checks independent. For automatic GitHub feedback, set `continue-on-error: true` on the Action step and emit a warning when `steps.landing.outcome == 'failure'`, as in the first-review example. The task retains its failure and logs; the workflow can continue. Set the Action's step timeout shorter than the job timeout so a timed-out task leaves time for the warning and artifact upload. Omit this property for explicit delegations that must fail the job. [GitHub integration](github.md#choose-who-can-delegate) covers caller policy, protected sources, and publishing identities. Fork PRs can run native CI without model or publication credentials.
 
@@ -20,9 +20,9 @@ Record the actual checked revision separately from the PR head. A merge checkout
 
 ## Cancel superseded reviews
 
-Put concurrency on the outer workflow before checks delay agent admission. Group by repository and PR, without the SHA, event name, or run ID, and set `cancel-in-progress: true`. The [first-review example](../get-started.md#add-the-workflow) shows this arrangement. Keep native checks in a separate workflow if they must continue for old candidates.
+Put concurrency on the calling workflow before checks delay agent admission. Group by repository and PR, without the SHA, event name, or run ID, and set `cancel-in-progress: true`. The [first-review example](../get-started.md#add-the-workflow) shows this arrangement. Keep native checks in a separate workflow if they must continue for old candidates.
 
-Use a different group for a called workflow: GitHub supplies the caller's workflow name inside reusable workflows, so a shared cancelling group can cancel the caller. A composite Action cannot set workflow concurrency.
+The calling workflow owns concurrency; a composite Action cannot configure it.
 
 For explicit delegations that must be preserved, GitHub.com supports `queue: max` with `cancel-in-progress: false`, retaining up to 100 pending runs. Without `queue: max`, a new pending run replaces the single pending run. Check availability on GitHub Enterprise Server, or use Landing's server queue. See [GitHub concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 
