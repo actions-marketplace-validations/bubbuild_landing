@@ -5,22 +5,39 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
-import os
 import sys
+from collections.abc import Callable, Coroutine
 from contextlib import closing
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Annotated, NoReturn
+from typing import Annotated, Any, NoReturn
 
 import httpx
 import typer
-from pydantic import ValidationError
+from pydantic import AliasChoices, Field, ValidationError
+from pydantic_settings import SettingsConfigDict
 
+from landing.adapters.github import app as github_app
 from landing.commands import COMMANDS
 from landing.models import TERMINAL, Action, ActionRequest, FileInput
+from landing.settings import FileSettings
 from landing.tasks import Tasks
+
+
+class ExecutionSettings(FileSettings):
+    """CLI and service configuration, independent of SDK model settings."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="LANDING_", env_ignore_empty=True, populate_by_name=True, extra="ignore", hide_input_in_errors=True
+    )
+    db: Path | None = None
+    server: str | None = None
+    token: str | None = Field(default=None, repr=False)
+    github_repository: str | None = None
+    base_url: str | None = Field(default=None, validation_alias=AliasChoices("LANDING_BASE_URL", "BASE_URL"))
+
 
 app = typer.Typer(
     help="Explain CI failures, delegate fixes, and review evidence.",
@@ -29,7 +46,6 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 actions = typer.Typer(help="Inspect and control recorded actions.", no_args_is_help=True)
-app.add_typer(actions, name="action")
 
 JsonOutput = Annotated[bool, typer.Option("--json", help="Print records as JSON.")]
 Limit = Annotated[int, typer.Option(min=1, max=100, help="Maximum records to return.")]
@@ -46,11 +62,11 @@ def show_version(value: bool) -> None:
 def configure(
     ctx: typer.Context,
     db: Annotated[Path | None, typer.Option(help="Local SQLite path; overrides LANDING_DB.")] = None,
-    server: Annotated[str | None, typer.Option(envvar="LANDING_SERVER", help="Remote Landing server URL.")] = None,
+    server: Annotated[str | None, typer.Option(help="Remote Landing server URL.")] = None,
     skill_dir: Annotated[list[Path] | None, typer.Option(help="Additional trusted skill root (repeatable).")] = None,
     github_repository: Annotated[
         str | None,
-        typer.Option(envvar="LANDING_GITHUB_REPOSITORY", help="Repository context for the prepared gh CLI."),
+        typer.Option(help="Repository context for the prepared gh CLI."),
     ] = None,
     version: Annotated[
         bool,
@@ -59,6 +75,7 @@ def configure(
 ) -> None:
     ctx.ensure_object(dict)
     ctx.obj.update(db=db, server=server, skill_dir=skill_dir or [], github_repository=github_repository)
+    ctx.obj.update(command=ctx.invoked_subcommand, execute=execute)
 
 
 def delegate(
@@ -75,17 +92,7 @@ def delegate(
     output: Annotated[Path | None, typer.Option(help="Also write the result to this file.")] = None,
     detach: Annotated[bool, typer.Option(help="Return on remote admission.")] = False,
 ) -> NoReturn:
-    execute(
-        ctx,
-        command=ctx.info_name,
-        instruction=instruction,
-        input=input_files or [],
-        workspace=workspace,
-        check=check or [],
-        json=json_output,
-        output=output,
-        detach=detach,
-    )
+    execute(**locals())
 
 
 for name, help_text in {
@@ -101,7 +108,7 @@ for name, help_text in {
 def list_actions(
     ctx: typer.Context, limit: Limit = 50, cursor: str | None = None, json_output: JsonOutput = False
 ) -> NoReturn:
-    execute(ctx, command="action", operation="list", limit=limit, cursor=cursor, json=json_output)
+    execute(**locals())
 
 
 @actions.command("logs")
@@ -112,11 +119,11 @@ def logs(
     limit: Limit = 50,
     json_output: JsonOutput = False,
 ) -> NoReturn:
-    execute(ctx, command="action", operation="logs", id=action_id, after=after, limit=limit, json=json_output)
+    execute(**locals())
 
 
 def inspect_action(ctx: typer.Context, action_id: ActionId, json_output: JsonOutput = False) -> NoReturn:
-    execute(ctx, command="action", operation=ctx.info_name, id=action_id, json=json_output)
+    execute(**locals())
 
 
 actions.command("view", help="Read an action's status and result.")(inspect_action)
@@ -131,7 +138,7 @@ def watch(
     json_output: JsonOutput = False,
 ) -> NoReturn:
     """Wait for an action to finish."""
-    execute(ctx, command="action", operation="watch", id=action_id, exit_status=exit_status, json=json_output)
+    execute(**locals())
 
 
 @actions.command()
@@ -142,19 +149,19 @@ def retry(
     json_output: JsonOutput = False,
 ) -> NoReturn:
     """Retry a terminal action using its original request."""
-    execute(ctx, command="action", operation="retry", id=action_id, detach=detach, json=json_output)
+    execute(**locals())
 
 
 def database(args) -> Path:
-    return (args.db or Path(os.getenv("LANDING_DB", "~/.local/share/landing/landing.sqlite3"))).expanduser()
+    return (args.db or Path("~/.local/share/landing/landing.sqlite3")).expanduser()
 
 
 def build_request(args) -> ActionRequest:
-    if args.input.count("-") > 1:
+    if (args.input_files or []).count("-") > 1:
         message = "stdin can only be used once."
         raise ValueError(message)
     inputs = []
-    for name in args.input:
+    for name in args.input_files or []:
         content = sys.stdin.read() if name == "-" else Path(name).read_text(encoding="utf-8")
         inputs.append(
             FileInput(
@@ -171,13 +178,13 @@ def build_request(args) -> ActionRequest:
         instruction=args.instruction,
         input=inputs,
         workspace=workspace,
-        checks=args.check,
+        checks=args.check or [],
     )
 
 
 def display(value, args) -> None:
     data = [item.model_dump() for item in value] if isinstance(value, list) else value.model_dump()
-    if args.json or getattr(args, "operation", None) == "logs":
+    if args.json_output or getattr(args, "operation", None) == "logs":
         text = json.dumps(data, indent=2)
     elif isinstance(value, list):
         text = "ID\tMODE\tSTATUS\tUPDATED\tINSTRUCTION\n" + "\n".join(
@@ -222,7 +229,7 @@ async def call_api(client: httpx.AsyncClient, method: str, path: str, **kwargs):
 
 
 async def remote(args) -> int:
-    headers = {"Authorization": "Bearer " + os.environ["LANDING_TOKEN"]} if os.getenv("LANDING_TOKEN") else {}
+    headers = {"Authorization": "Bearer " + args.token} if args.token else {}
     async with httpx.AsyncClient(base_url=args.server.rstrip("/"), headers=headers, timeout=30) as client:
         call = partial(call_api, client)
 
@@ -238,16 +245,18 @@ async def remote(args) -> int:
         elif args.operation == "logs":
             from landing.models import Event
 
-            data = await call("GET", f"/v1/actions/{args.id}/events", params={"after": args.after, "limit": args.limit})
+            data = await call(
+                "GET", f"/v1/actions/{args.action_id}/events", params={"after": args.after, "limit": args.limit}
+            )
             display([Event.model_validate(item) for item in data], args)
             return 0
         elif args.operation == "retry":
-            action = Action.model_validate(await call("POST", f"/v1/actions/{args.id}/retries"))
+            action = Action.model_validate(await call("POST", f"/v1/actions/{args.action_id}/retries"))
         elif args.operation == "cancel":
-            display(Action.model_validate(await call("POST", f"/v1/actions/{args.id}/cancellation")), args)
+            display(Action.model_validate(await call("POST", f"/v1/actions/{args.action_id}/cancellation")), args)
             return 0
         else:
-            action = await get(args.id)
+            action = await get(args.action_id)
             if args.operation == "view":
                 display(action, args)
                 return 0
@@ -266,17 +275,17 @@ async def local(args) -> int:
             if args.operation == "list":
                 display(tasks.list(args.limit, args.cursor), args)
             elif args.operation == "logs":
-                display(tasks.events(args.id, args.after, args.limit), args)
+                display(tasks.events(args.action_id, args.after, args.limit), args)
             elif args.operation == "cancel":
-                display(tasks.cancel(args.id), args)
+                display(tasks.cancel(args.action_id), args)
             elif args.operation == "view":
-                display(tasks.get(args.id), args)
+                display(tasks.get(args.action_id), args)
             else:
 
                 async def get(action_id):
                     return tasks.get(action_id)
 
-                action = await wait(args.id, get, remote=False)
+                action = await wait(args.action_id, get, remote=False)
                 display(action, args)
                 return action.exit_code() if args.exit_status else 0
         return 0
@@ -287,19 +296,21 @@ async def local(args) -> int:
         skill_dirs=args.skill_dir,
     )
     async with runtime.running():
-        request = build_request(args) if args.command in COMMANDS else runtime.tasks.request(args.id)
-        if args.github_repository and repository_context(args.github_repository) not in request.input:
-            request = request.model_copy(update={"input": [*request.input, repository_context(args.github_repository)]})
+        request = build_request(args) if args.command in COMMANDS else runtime.tasks.request(args.action_id)
+        if args.github_repository:
+            context = repository_context(args.github_repository)
+            if context not in request.input:
+                request = request.model_copy(update={"input": [*request.input, context]})
         if args.command in COMMANDS:
             action = await runtime.command(args.command, request)
         else:
-            action = await runtime.run(request, retry_of=args.id if args.command == "action" else None)
+            action = await runtime.run(request, retry_of=args.action_id)
         display(action, args)
         return action.exit_code()
 
 
-def validate_args(args) -> None:
-    if args.server and (args.db is not None or args.command == "serve"):
+def validate_args(args, ctx: typer.Context) -> None:
+    if args.server and (ctx.obj["db"] is not None or args.command == "serve"):
         message = "--server cannot be combined with --db or serve."
         raise ValueError(message)
     if args.server and args.skill_dir:
@@ -320,7 +331,7 @@ def serve(
     ] = None,
 ) -> NoReturn:
     """Run the HTTP service with registered workspaces."""
-    execute(ctx, command="serve", host=host, port=port, workspace=workspace or [], json=False)
+    execute(**locals())
 
 
 def start_server(args) -> None:
@@ -329,13 +340,13 @@ def start_server(args) -> None:
     from landing.server import create_app
 
     workspaces = {"default": Path.cwd()}
-    for value in args.workspace:
+    for value in args.workspace or []:
         name, separator, path = value.partition("=")
         if not separator or not name or not path:
             message = "Register a workspace as NAME=PATH."
             raise ValueError(message)
         workspaces[name] = Path(path).expanduser().resolve()
-    token = os.getenv("LANDING_TOKEN")
+    token = args.token
     if args.host not in {"127.0.0.1", "localhost", "::1"} and not token:
         message = "Set LANDING_TOKEN before listening beyond localhost."
         raise ValueError(message)
@@ -344,7 +355,7 @@ def start_server(args) -> None:
             database(args),
             workspaces=workspaces,
             token=token,
-            base_url=os.getenv("BASE_URL"),
+            base_url=args.base_url,
             github_repository=args.github_repository,
             skill_dirs=args.skill_dir,
         ),
@@ -353,26 +364,40 @@ def start_server(args) -> None:
     )
 
 
-def execute(ctx: typer.Context, **parameters) -> NoReturn:
-    args = SimpleNamespace(**ctx.obj, **parameters)
+def execute(
+    ctx: typer.Context, *, handler: Callable[[SimpleNamespace], Coroutine[Any, Any, int]] | None = None, **parameters
+) -> NoReturn:
+    args = SimpleNamespace(**ctx.obj, **parameters, operation=ctx.info_name)
     try:
-        validate_args(args)
-        if args.command == "serve":
+        vars(args).update(
+            ExecutionSettings(**{name: value for name, value in vars(args).items() if value is not None}).model_dump()
+        )
+        validate_args(args, ctx)
+        if handler is not None:
+            code = asyncio.run(handler(args))
+        elif args.command == "serve":
             ctx.obj.get("start_server", start_server)(args)
             code = 0
         else:
             code = asyncio.run(remote(args) if args.server else local(args))
     except (ValueError, ValidationError, OSError, KeyError) as exc:
-        if args.json:
+        if getattr(args, "json_output", False):
             print(json.dumps({"error": {"code": "invalid_request", "message": str(exc)}}))
         typer.echo(str(exc), err=True)
         code = 2
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        code = 1
     except httpx.RequestError as exc:
         typer.echo(f"Remote request failed: {str(exc) or type(exc).__name__}", err=True)
         code = 1
     except httpx.HTTPStatusError:
         code = 1
     raise typer.Exit(code)
+
+
+app.add_typer(actions, name="action")
+app.add_typer(github_app)
 
 
 def main(argv: list[str] | None = None) -> int:
