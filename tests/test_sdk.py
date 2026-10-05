@@ -11,6 +11,7 @@ from bub.channels.message import ChannelMessage
 from landing.models import ActionRequest
 from landing.runtime import Runtime
 from tests.conftest import completion
+from tests.provider import provider
 
 
 async def output(stream):
@@ -51,6 +52,44 @@ def test_commands_delegate_the_same_work(tmp_path, model, command, mode, integra
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("integration", ["local", "embedded", "sdk", "hooks"])
+def test_delegated_work_writes_to_the_selected_workspace(tmp_path, model, integration):
+    project = tmp_path / "project"
+    project.mkdir()
+    responses, _ = model
+    responses.extend([
+        completion(tool="fs_write", arguments={"path": "answer.txt", "content": "42"}),
+        completion("Wrote the answer."),
+    ])
+
+    async def run():
+        framework = None
+        if integration != "local":
+            framework = BubFramework()
+            framework.workspace = tmp_path
+            framework.load_builtin_hooks()
+        async with Runtime(
+            tmp_path / "landing.sqlite3", framework=framework, workspaces={"default": project}
+        ).running() as landing:
+            if integration == "hooks":
+                result = await landing.framework.process_inbound(
+                    ChannelMessage(session_id="writer", channel="cli", content=',fix "Write the answer."')
+                )
+                assert result.model_output == "Wrote the answer."
+            elif integration == "sdk":
+                assert (
+                    await output(await landing.agent.run_stream(session_id="writer", prompt=',fix "Write the answer."'))
+                    == "Wrote the answer."
+                )
+            else:
+                action = await landing.run(ActionRequest(mode="fixer", instruction="Write the answer."))
+                assert action.status == "completed"
+            assert (project / "answer.txt").read_text() == "42"
+            assert not (tmp_path / "answer.txt").exists()
+
+    asyncio.run(run())
+
+
 def test_mode_survives_restart_without_leaking_between_sessions(tmp_path, model, monkeypatch):
     settings = tmp_path / "settings.yml"
     settings.write_text(json.dumps({"db": [], "server": []}))
@@ -78,14 +117,13 @@ def test_mode_survives_restart_without_leaking_between_sessions(tmp_path, model,
     asyncio.run(run())
 
 
-def test_sdk_capability_selection_and_per_turn_model_are_preserved(tmp_path, model):
-    responses, requests = model
-    responses.extend([
+def test_sdk_capability_selection_and_per_turn_model_are_preserved(tmp_path, monkeypatch):
+    responses = [
         completion(tool="fs_write", arguments={"path": "answer.txt", "content": "42"}),
         completion("The write capability is unavailable."),
         completion(tool="fs_write", arguments={"path": "answer.txt", "content": "42"}),
         completion("Wrote the answer."),
-    ])
+    ]
 
     async def run():
         async with Runtime(tmp_path / "landing.sqlite3").running() as landing:
@@ -100,9 +138,15 @@ def test_sdk_capability_selection_and_per_turn_model_are_preserved(tmp_path, mod
             )
             assert await output(stream) == "Wrote the answer."
             assert (tmp_path / "answer.txt").read_text() == "42"
-        assert requests[0]["model"] == "openai:chosen-model"
 
-    asyncio.run(run())
+    with provider(responses) as (api_base, requests):
+        monkeypatch.setenv("LANDING_MODEL", "openai:default-model")
+        monkeypatch.setenv("LANDING_API_KEY", "test-key")
+        monkeypatch.setenv("LANDING_API_BASE", api_base)
+        monkeypatch.setenv("LANDING_CLIENT_ARGS", '{"max_retries": 0}')
+        asyncio.run(run())
+        assert requests[0]["model"] == "chosen-model"
+        assert requests[-1]["model"] == "default-model"
 
 
 def test_content_parts_remain_evidence_and_explicit_state_skips_recovery(tmp_path, model):

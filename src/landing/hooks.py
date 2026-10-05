@@ -9,33 +9,32 @@ from bub.hooks.interception import LlmCallDecision
 from bub.utils import workspace_from_state
 from pydantic import ValidationError
 
+from landing.database import open_database
 from landing.prompts import COMMON, MODES
+from landing.store import SQLiteTapeStore
+from landing.tasks import Tasks
 
 if TYPE_CHECKING:
     from landing.runtime import Runtime
 
 
-class SDKDefaults(BuiltinImpl):
-    """Keep native repository guidance without packaged channel instructions."""
+class LandingHooks(BuiltinImpl):
+    """Native defaults and business hooks shared by hook and SDK calls."""
 
-    @hookimpl
-    def system_prompt(self, prompt, state) -> str:
-        return self._read_agents_file(state)
+    def __init__(self, runtime: "Runtime") -> None:
+        super().__init__(runtime.framework)
+        self.runtime = runtime
+
+    def _get_agent(self, state=None):
+        return self.runtime.agent.bub
 
     @hookimpl
     def provide_environment(self, session_id, workspace):
-        # Native tools derive their local environment from the selected task workspace.
+        # Native tools resolve the task workspace unless a host supplies an environment.
         return None
 
-
-class LandingHooks:
-    """Use the same modes, task sidecar, and executor in hook and SDK integrations."""
-
-    def __init__(self, runtime: "Runtime") -> None:
-        self.runtime = runtime
-
-    @hookimpl
-    async def load_state(self, message, session_id):
+    @hookimpl(specname="load_state")
+    async def load_landing_state(self, message, session_id):
         tape = self.runtime.agent.tape.session_tape(session_id, self.runtime.framework.workspace)
         selected = "explainer"
         for entry in await tape.store.fetch_all(tape.query().kinds("event")):
@@ -46,7 +45,12 @@ class LandingHooks:
     @hookimpl
     def system_prompt(self, prompt, state) -> str:
         workspace = workspace_from_state(state)
-        return COMMON + MODES[state.get("landing_mode", "explainer")] + f"\nTask workspace: {workspace}\n"
+        return (
+            COMMON
+            + MODES[state.get("landing_mode", "explainer")]
+            + f"\nTask workspace: {workspace}\n"
+            + self._read_agents_file(state)
+        )
 
     @hookimpl
     def before_llm_call(self, request, state):
@@ -55,8 +59,8 @@ class LandingHooks:
         if reason := state.get("landing_no_update"):
             return LlmCallDecision.finish(reason)
 
-    @hookimpl
-    def after_tool_call(self, call, result, state) -> None:
+    @hookimpl(specname="after_tool_call")
+    def observe_tool_result(self, call, result, state) -> None:
         if result.error is not None:
             state["landing_tool_failed"] = True
 
@@ -94,13 +98,31 @@ class LandingHooks:
             self.runtime.tasks.event(state["landing_action_id"], "issue.unchanged", {"reason": reason})
 
     @hookimpl
+    async def run_model_stream(self, prompt, session_id, state):
+        return await self.runtime.agent.run_stream(prompt=prompt, session_id=session_id, state=state)
+
+    @hookimpl(specname="provide_lifespan")
+    async def storage_lifespan(self):
+        with open_database(self.runtime.path) as engine:
+            self.runtime.tasks = Tasks(engine)
+            self.runtime.store = SQLiteTapeStore(engine)
+            yield
+
+    @hookimpl
     def provide_tape_store(self):
         return self.runtime.store
 
-    @hookimpl
-    def provide_tape_sidecar(self):
+    @hookimpl(specname="provide_tape_sidecar")
+    def task_sidecar(self):
         return self.runtime.tasks
 
-    @hookimpl
-    async def run_model_stream(self, prompt, session_id, state):
-        return await self.runtime.agent.run_stream(prompt=prompt, session_id=session_id, state=state)
+
+def install_hooks(runtime: "Runtime") -> LandingHooks:
+    """Compose native defaults, business hooks, and storage through Bub's SDK."""
+    manager = runtime.framework.plugin_manager
+    builtin = manager.get_plugin("builtin")
+    if type(builtin) is BuiltinImpl:
+        manager.unregister(builtin)
+    hooks = LandingHooks(runtime)
+    manager.register(hooks, name="landing")
+    return hooks
