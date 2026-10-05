@@ -43,7 +43,7 @@ SDK text / message hooks ----------------------------+         |
                                                          Final Action
 ```
 
-`LandingHooks` composes native defaults, business state, and storage through Bub's SDK hooks while preserving host hooks. Its system prompt supplies common behavior, the selected mode, configured additions and root `AGENTS.md`, followed by the workspace path so temporary checkout paths preserve the preceding prefix. Bub appends native tool and skill guidance; cache reuse also depends on those capabilities and the provider. Task inputs contain instructions and evidence. GitHub adaptation owns destination and platform templates. One renderer substitutes named values in owned templates once; inserted instructions and evidence stay literal. Manage mode additions through existing settings while keeping default blocks and template selection in their owning modules.
+`LandingHooks` composes native defaults, business state, and storage through Bub's SDK hooks while preserving host hooks. Its system prompt supplies common behavior, the selected mode's permitted skill through Bub's public discovery and reading APIs, configured additions and root `AGENTS.md`, followed by the workspace path so temporary checkout paths preserve the preceding prefix. Bub appends native tool and skill guidance; cache reuse also depends on those capabilities and the provider. Task inputs contain instructions and evidence. GitHub adaptation owns destination and platform templates. One renderer substitutes named values in owned templates once; inserted instructions and evidence stay literal. Bundled mode methods live in `src/landing/skills` and ship with the package. The hook loads the resolved method on each model call; native task hints and the skill tool load supplementary methods. Manage additions and capability exclusions through existing mode settings.
 
 Bub's lifespan owns one SQLAlchemy Core Engine shared by the task sidecar and tape adapter. Both use scoped connections; action transitions record their events in the same transaction. Task records remain independent of model history.
 
@@ -88,7 +88,7 @@ Bundled jobs use a 120-second model request timeout. Main's feedback Action has 
 
 ## Publish a release
 
-Set the version with `uv version VERSION` and update installation examples and Action references. After validation and merge, publish a GitHub release with the matching unprefixed tag, such as `0.1.2`. The workflow verifies the version, publishes to PyPI and GHCR, and deploys the documentation. The tag also selects the Action; stable images update `latest`.
+Set the version with `uv version VERSION` and update installation examples and Action references. After validation and merge, publish a GitHub release with the matching unprefixed tag, such as `0.2.0`. The workflow verifies the version, publishes to PyPI and GHCR, and deploys the documentation. The tag also selects the Action; stable images update `latest`.
 
 ## Learn from outcomes
 
