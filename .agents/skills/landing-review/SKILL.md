@@ -1,19 +1,22 @@
 ---
 name: landing-review
-description: Review Landing's public contracts, SDK reuse, SQLite lifecycle, GitHub delivery, and browser evidence.
+description: Review Landing changes against supported CLI, HTTP, SDK, and GitHub behavior using candidate evidence.
 ---
 
-Select the affected entry point and owning layer. Use these project constraints to resolve concrete questions, then conclude with the native check evidence. Read the relevant contract in `docs/reference/` when needed.
+Read the affected Landing contract in `docs/reference/` and trace the supported user workflow on the current candidate. Apply the concerns below where the diff reaches them. Default mode guidance owns investigation and delivery; root `AGENTS.md` owns project development rules.
 
-- Preserve shared action semantics across CLI, HTTP, SDK, and CI. Four modes use one Bub 0.5.0 loop with native settings, state, hooks, tools, and skills.
-- Preserve SQLite task and tape history, idempotent admission and delivery, cancellation, and one worker per database. Container acceptance covers Litestream and full-volume recovery.
-- Preserve Landing-first configuration with native Bub fallback, prepared skill roots, and optional per-mode capability limits. Instructions and tool filters do not create a sandbox.
-- Keep GitHub adaptation thin: use prepared identities, native caller permissions, exact publication destinations, and stale-candidate cancellation. Quiet issuer follow-up is for unchanged automatic work; explicit delegations require replies.
-- Use `github-context.json`'s `ci_checkout` for the native check revision, not the trigger SHA. A switched workspace does not reload the installed runtime. Follow actual workflow preparation when evaluating CI behavior.
-- Tests isolate ambient Landing and Bub settings. Local protocol fixtures establish exercised behavior, not real-provider quality or deployment recovery.
+## Follow the affected entry point
 
-Trace the actual caller when checking delegation: typed calls and the streaming facade share execution without sharing every step. An admission receipt does not establish the final outcome; read the action's current status and result. Follow `docs/development.md` for behavior testing and verify recovery against the relevant failure.
+Trace the actual caller through admission, execution, and the result the person receives. An admission receipt is not completion; inspect the action's final status and result. For shared behavior changes, inspect the equivalent CLI, HTTP, SDK, or message path before reporting a mismatch. Do not require identical internals or port a fix to an unaffected path. CLI review exit codes and advisory GitHub decisions intentionally differ; direct SDK streams leave rendering and delivery to the host.
 
-For a frontend problem that needs reproduction, use Playwright MCP with an existing URL or start the project's service through the shell. Check that the behavior corresponds to the candidate under review. Report only reproduced problems; a screenshot alone does not establish a bug, and binary image placeholders do not mean the model inspected the image.
+## Check relevant contracts
 
-Save one useful screenshot in `.ci-state/browser` under the checkout, using an absolute filename or omitting it to use the server's output directory. With gh 2.99 or later and an upload-capable prepared identity, use `gh pr comment NUMBER --body "Reproduction evidence." --attach "PATH#Short description"` and link that comment from the review or thread reply. GitHub App installation tokens, including the default workflow token, cannot upload attachments; link the workflow run and name its Landing artifact, uploaded after feedback. Keep the finding short and describe what the person sees. Do not duplicate evidence or change credentials to upload it.
+- Lifecycle changes preserve cancellation, shutdown interruption, queued recovery, idempotency, and one worker per database. Exercise released SQLite data when assessing upgrades; fresh databases do not establish history preservation. Resetting model history must not erase action records. Container recovery uses the actual Litestream replica or volume backup being claimed.
+- Configuration changes preserve Landing-first settings with Bub fallback, selected workspace guidance, prepared skills and MCP tools, and per-call limits that narrow mode capabilities. Instructions and tool filters are not a sandbox. Local fixtures isolate ambient settings and do not prove real-provider compatibility.
+- GitHub changes preserve native caller authorization, prepared publishing identities, the original destination, delivery verification, and stale-candidate cancellation. Automatic issuer work can complete quietly; explicit questions and delegations require a confirmed reply. Verify delivery and replay behavior through the original conversation or review thread.
+
+## Browser evidence
+
+For an affected frontend workflow, use Playwright MCP with an existing URL or start the candidate's service. Describe the observed behavior; a screenshot or binary image placeholder alone does not prove a defect.
+
+Pass an absolute screenshot filename under `$GITHUB_WORKSPACE/.ci-state/browser` in CI; locally, use the task workspace's `.ci-state/browser` directory. The workflow collects that CI directory after feedback; a relative server output path may resolve elsewhere. With gh 2.99 or later and an upload-capable prepared identity, use `gh pr comment NUMBER --body "Reproduction evidence." --attach "PATH#Short description"` and link the comment from the finding or thread reply. GitHub App installation tokens, including the default workflow token, cannot upload attachments; link the workflow run and name its Landing artifact instead. Do not change credentials to attach evidence.
