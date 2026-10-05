@@ -22,7 +22,7 @@ from landing.commands import COMMANDS
 from landing.hooks import install_hooks
 from landing.mcp import MCPChannel, connected_tools
 from landing.models import Action, ActionRequest, Decision
-from landing.prompts import MODES as PROMPTS
+from landing.prompts import render
 from landing.settings import ConfigurationFile, ModeSettings, Settings
 from landing.store import SQLiteTapeStore
 from landing.tasks import Tasks
@@ -50,11 +50,16 @@ def checks_failed(checks: list[dict]) -> bool:
 
 
 def task_prompt(request: ActionRequest, checks: list[dict]) -> list[dict]:
-    prompt = request.instruction or PROMPTS[request.mode]
-    for item in request.input:
-        prompt += "\n\n" + (item.text if item.type == "text" else f"{item.name}:\n{item.content}")
-    if checks:
-        prompt += "\n\nValidation results:\n" + json.dumps(checks)
+    evidence = "\n\n".join(
+        item.text if item.type == "text" else render("$name:\n$content", name=item.name, content=item.content)
+        for item in request.input
+    )
+    prompt = render(
+        "$instruction\n\n$evidence\n\n$checks",
+        instruction=request.instruction or "Carry out the delegated work using the supplied evidence.",
+        evidence=evidence,
+        checks=render("Validation results:\n$results", results=json.dumps(checks)) if checks else "",
+    )
     return [{"type": "text", "text": prompt}]
 
 
@@ -130,13 +135,16 @@ class Runtime:
         action, _ = self.tasks.create(request, retry_of=retry_of)
         return await self._wait(action.id)
 
-    async def _wait(self, action_id: str, **kwargs) -> Action:
+    async def _wait(self, action_id: str, *, cancel_on_interrupt: bool = True, **kwargs) -> Action:
         task = asyncio.create_task(self.execute(action_id, **kwargs))
         self.active[action_id] = task
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            self.cancel(action_id)
+            if cancel_on_interrupt:
+                self.cancel(action_id)
+            else:
+                task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             raise
         finally:
@@ -322,7 +330,7 @@ class Runtime:
 
         async def drive():
             try:
-                action = await self.execute(action_id, state=state, events=events, stream_state=stream_state)
+                action = await self._wait(action_id, state=state, events=events, stream_state=stream_state)
                 if action.error and stream_state.error is None:
                     stream_state.error = BubError(ErrorKind.UNKNOWN, action.error["message"])
                     events.put_nowait(StreamEvent("error", stream_state.error.as_dict()))
@@ -332,7 +340,6 @@ class Runtime:
         async def iterate():
             nonlocal task
             task = asyncio.create_task(drive())
-            self.active[action_id] = task
             while (event := await events.get()) is not None:
                 yield event
             await task
@@ -342,7 +349,6 @@ class Runtime:
                 self.cancel(action_id)
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
-            self.active.pop(action_id, None)
 
         return AsyncStreamEvents(iterate(), state=stream_state, on_close=close)
 
@@ -359,15 +365,11 @@ class Runtime:
                 if action_id is None:
                     await asyncio.sleep(0.1)
                     continue
-                task = asyncio.create_task(self.execute(action_id))
-                self.active[action_id] = task
                 try:
-                    await task
+                    await self._wait(action_id, cancel_on_interrupt=False)
                 except asyncio.CancelledError:
                     if (parent := asyncio.current_task()) and parent.cancelling():
                         raise
-                finally:
-                    self.active.pop(action_id, None)
         finally:
             await self.stop()
 

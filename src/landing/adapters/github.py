@@ -22,8 +22,21 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from landing.commands import COMMANDS
 from landing.models import Action, ActionRequest, FileInput, Mode
+from landing.prompts import render
 from landing.runtime import Runtime
 from landing.tasks import Tasks
+
+REPOSITORY_GUIDANCE = "GitHub repository: $repository. Use the prepared gh CLI. In GitHub conversations use #number or owner/repo#number outside code spans; elsewhere use explicit links. Read contribution templates from the checkout's standard GitHub locations when needed."
+
+PUBLICATION_GUIDANCE = "When publishing, include $stamp at the start of the body to identify this delivery. For a body file, use gh pr/issue comment --body-file FILE or gh api -F body=@FILE; -f body=@FILE sends the literal path. Use --input FILE for a JSON payload. Refresh the current PR head before publishing. Supplemental evidence may be linked from the required reply or review; a separate evidence comment cannot replace that publication. The context records the candidate head separately from the actual CI checkout revision."
+
+THREAD_GUIDANCE = "Reply in the original thread with POST repos/$repository/pulls/$number/comments/$thread/replies, rather than a new review. Include the delivery marker, or call confirm_reply with the returned comment ID. For a fix, follow repository CI dispatch instructions and link pending checks in this reply."
+
+REVIEW_GUIDANCE = "Publish a native GitHub COMMENT review on PR #$number; APPROVE and REQUEST_CHANGES require separate explicit authorization. Use the reviews API with commit_id, body and inline comments containing path, line and side; ranges also use start_line and start_side. Verify locations against the inspected diff. Put the delivery marker in the review body. Native check jobs are independent of Landing feedback; do not wait for this feedback job or the enclosing workflow to complete."
+
+AUTOMATIC_GUIDANCE = "This is automatic follow-up; no_update is available when there is no useful change."
+
+CONVERSATION_GUIDANCE = "Reply to issue or PR #$number with the result and publication links. Call confirm_reply with the returned conversation comment ID to read back the published body."
 
 
 class GitHubEnvironment(BaseSettings):
@@ -325,7 +338,7 @@ async def interruptible(awaitable):
 def repository_context(repository: str) -> FileInput:
     return FileInput(
         name="github-repository.txt",
-        content=f"GitHub repository: {repository}. Use the prepared gh CLI and this repository's instructions. Do not change authentication. In GitHub conversations use #number or owner/repo#number and commit links that render as short hashes; keep autolink references outside code spans. Elsewhere use explicit links. Link directly to relevant reviews, comments, jobs and file lines with short descriptive labels. Read only the applicable contribution template from the checkout's standard GitHub locations when needed.",
+        content=render(REPOSITORY_GUIDANCE, repository=repository),
     )
 
 
@@ -412,22 +425,18 @@ async def run(
             }
         },
     }
-    guidance = (
-        f"When publishing, include {stamp} at the start of the body to identify this delivery. "
-        "For a body file, use gh pr/issue comment --body-file FILE or gh api -F body=@FILE; -f body=@FILE sends the literal path. Use --input FILE for a JSON payload. "
-        "Read back the published body and check its content and destination before claiming success; an ID or URL alone is insufficient. Refresh the current PR head before publishing. "
-        "Supplemental evidence may be linked from the required reply or review; a separate evidence comment cannot replace that publication. "
-        "Keep the candidate head and the actual CI checkout revision distinct. "
-        "Use the supplied target reference, comment and checkout relationship. Fetch the specific target details, discussion or diff needed for this task; do not load all issues or review history."
-    )
+    destination = ""
     if thread:
-        guidance += f" Read the original comment at repos/{repository}/pulls/comments/{thread}. Reply in this thread with POST repos/{repository}/pulls/{number}/comments/{thread}/replies; do not open a new review. Include the delivery marker, or call confirm_reply with the returned comment ID after a successful reply. For a fix, finish after needed local validation, push, native CI dispatch and this reply; report pending CI with its link. Wait for native results only when explicitly requested, and never wait for this duty or Landing feedback job."
+        destination = THREAD_GUIDANCE
     elif expected_review:
-        guidance += f" This delegation authorizes publishing a native GitHub COMMENT review on PR #{number}. The verdict and findings belong in this review. Publish it yourself using the supplied native check conclusions. Evaluate native check jobs separately from Landing feedback; the enclosing workflow cannot finish while its feedback job is running. Do not wait for that workflow to complete or for another Landing review. Use event COMMENT for allow, block and inconclusive verdicts. APPROVE and REQUEST_CHANGES require separate explicit repository authorization. Use the reviews API with commit_id, body, and native comments containing path, line, and side for actionable findings. Use start_line and start_side for ranges. Verify every location against the inspected diff. Put the marker in the review body, followed by a brief verdict such as 'One blocking finding; see inline.' or 'No blocking findings.' Keep finding explanations in inline comments; omit revision, diff and successful-check recaps. Do not invent findings merely to add inline comments. Record the gate decision separately."
+        destination = REVIEW_GUIDANCE
     elif mode == "issuer" and not reply_required:
-        guidance += " This is automatic follow-up. Update a matching issue only for useful new evidence or changed conditions. Otherwise call no_update and complete without a public write."
+        destination = AUTOMATIC_GUIDANCE
     elif number:
-        guidance += f" Reply to issue or PR #{number} with the result and publication links. Call confirm_reply with the returned conversation comment ID to read back the published body. For a fix, verify the candidate before committing, pushing, and opening or updating its PR using gh; follow repository CI instructions."
+        destination = CONVERSATION_GUIDANCE
+    guidance = render(
+        PUBLICATION_GUIDANCE, destination, repository=repository, number=number, thread=thread, stamp=stamp
+    )
     source_input = FileInput(name="github-context.json", content=json.dumps(source))
     request = ActionRequest(
         mode=mode,
