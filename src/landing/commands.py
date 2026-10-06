@@ -37,16 +37,19 @@ def admit(request: ActionRequest, *, context: ToolContext) -> Action:
 
 def register_command(name: str, selected: Mode) -> None:
     @tool(name=name, context=True, agent_use=False)
-    async def delegate(instruction: str = "", *, context: ToolContext) -> Action:
+    async def delegate(instruction: str | ActionRequest = "", *, context: ToolContext) -> Action:
         """Delegate work in the prepared workspace and return its task receipt."""
-        request = ActionRequest.model_validate({
-            **context.state.get("landing_request", {}),
-            "mode": selected,
-            "instruction": instruction or None,
-        })
+        request = (
+            instruction
+            if isinstance(instruction, ActionRequest)
+            else ActionRequest(
+                mode=selected, instruction=instruction or None, workspace=context.state.get("landing_workspace")
+            )
+        )
+        if request.mode != selected:
+            request = ActionRequest.model_validate(request.model_copy(update={"mode": selected}))
         action = admit(request, context=context)
         await mode.run(selected, context=context)
-        context.state["landing_pending_action"] = action.id
         return action
 
 
