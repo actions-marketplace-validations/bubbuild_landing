@@ -11,7 +11,9 @@ RUN uv sync --frozen --no-dev --no-editable --no-cache
 FROM python:3.12-slim-bookworm
 LABEL org.opencontainers.image.source="https://github.com/bubbuild/landing"
 
-RUN apt-get update \
+ADD --chmod=644 https://cli.github.com/packages/githubcli-archive-keyring.gpg /etc/apt/keyrings/githubcli-archive-keyring.gpg
+RUN printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main' > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends git gh ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 landing \
@@ -27,6 +29,7 @@ COPY --chmod=755 container/entrypoint /usr/local/bin/landing-entrypoint
 
 ENV PATH="/opt/landing/.venv/bin:$PATH" \
     LANDING_DB="/storage/landing.sqlite3" \
+    LANDING_REPLICATE="true" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 USER 1000:1000

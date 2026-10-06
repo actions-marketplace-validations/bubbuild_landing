@@ -4,9 +4,11 @@ import subprocess
 import sys
 
 import pytest
+from bub import BubFramework
 from typer.testing import CliRunner
 
-from landing.cli import app, main
+from landing.cli import create_cli_app, main
+from landing.runtime import Runtime
 from tests.conftest import completion
 
 
@@ -64,7 +66,7 @@ def test_cli_reads_piped_evidence_and_writes_json_result(tmp_path, model):
     responses.append(report_reference)
     destination = tmp_path / "result.json"
     result = CliRunner().invoke(
-        app,
+        create_cli_app(),
         ["--db", str(tmp_path / "landing.sqlite3"), "explain", "--input", "-", "--output", str(destination), "--json"],
         input="reference=approved",
     )
@@ -75,20 +77,31 @@ def test_cli_reads_piped_evidence_and_writes_json_result(tmp_path, model):
 
 def test_captured_help_and_diagnostics_remain_plain_in_ci():
     environment = {**os.environ, "GITHUB_ACTIONS": "true", "FORCE_COLOR": "1"}
-    for arguments, status in ((["triage", "--help"], 0), (["action", "list", "--limit", "0", "--json"], 2)):
+    for arguments, status in (
+        (["triage", "--help"], 0),
+        (["--show-completion"], 0),
+        (["action", "list", "--limit", "0", "--json"], 2),
+    ):
         result = subprocess.run(  # noqa: S603 -- exercise the installed CLI with explicit arguments.
-            [sys.executable, "-m", "landing", *arguments], capture_output=True, text=True, env=environment, check=False
+            ["/bin/bash", "-c", '"$0" -m landing "$@" || exit', sys.executable, *arguments],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
         )
         assert result.returncode == status
         assert "\x1b[" not in result.stdout + result.stderr
         if status:
             assert not result.stdout
             assert "--limit" in result.stderr
+        elif "--show-completion" in arguments:
+            assert "_LANDING_COMPLETE" in result.stdout
         else:
             assert "--help" in result.stdout
 
 
-def test_fix_uses_selected_workspace_for_files_and_shell(tmp_path, model, monkeypatch, capsys):
+@pytest.mark.parametrize("native_host", [False, True])
+def test_fix_uses_selected_workspace_for_files_and_shell(tmp_path, model, monkeypatch, native_host):
     responses, _ = model
     caller = tmp_path / "caller"
     candidate = tmp_path / "candidate"
@@ -100,21 +113,50 @@ def test_fix_uses_selected_workspace_for_files_and_shell(tmp_path, model, monkey
         completion(tool="bash", arguments={"command": 'test "$(cat answer.txt)" = 42'}),
         completion("Wrote and checked the candidate's answer."),
     ])
-    assert (
-        main([
-            "--db",
-            str(tmp_path / "landing.sqlite3"),
-            "fix",
-            "Write the answer.",
-            "--workspace",
-            str(candidate),
-            "--json",
-        ])
-        == 0
-    )
-    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+    database = tmp_path / "landing.sqlite3"
+    app = Runtime(database, framework=BubFramework()).framework.create_cli_app() if native_host else create_cli_app()
+    options = ["--workspace", str(candidate)] if native_host else ["--db", str(database)]
+    workspace = [] if native_host else ["--workspace", str(candidate)]
+    runner = CliRunner()
+    result = runner.invoke(app, [*options, "fix", "Write the answer.", *workspace, "--json"])
+    assert result.exit_code == 0, result.output
+    action = json.loads(result.stdout)
+    assert action["status"] == "completed"
+    result = runner.invoke(app, [*options[:2], "action", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == [action]
     assert (candidate / "answer.txt").read_text() == "42"
     assert not (caller / "answer.txt").exists()
+
+
+@pytest.mark.parametrize("workspace", [None, "../candidate"])
+def test_retry_keeps_original_workspace_after_changing_directory(tmp_path, model, monkeypatch, capsys, workspace):
+    candidate = tmp_path / "candidate"
+    caller = tmp_path / "caller"
+    candidate.mkdir()
+    caller.mkdir()
+    monkeypatch.chdir(candidate if workspace is None else caller)
+    responses, _ = model
+    responses.extend([
+        completion(tool="fs_write", arguments={"path": "answer.txt", "content": "initial"}),
+        completion("Saved the answer."),
+        completion(tool="fs_write", arguments={"path": "answer.txt", "content": "retried"}),
+        completion("Saved the retry."),
+    ])
+    options = ["--db", str(tmp_path / "landing.sqlite3")]
+    selection = ["--workspace", workspace] if workspace is not None else []
+    assert main([*options, "fix", "Write the answer.", *selection, "--json"]) == 0
+    action = json.loads(capsys.readouterr().out)
+    assert (candidate / "answer.txt").read_text() == "initial"
+    elsewhere = tmp_path / "other" / "caller"
+    elsewhere.mkdir(parents=True)
+    alternate = elsewhere.parent / "candidate"
+    alternate.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert main([*options, "action", "retry", action["id"], "--json"]) == 0
+    assert (candidate / "answer.txt").read_text() == "retried"
+    assert not (elsewhere / "answer.txt").exists()
+    assert not (alternate / "answer.txt").exists()
 
 
 def test_malformed_tool_call_leaves_inspectable_diagnostics_without_arguments(tmp_path, model, capsys):
