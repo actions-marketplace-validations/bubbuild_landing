@@ -67,15 +67,21 @@ modes:
     allowed_skills: [landing-explainer, documentation-writer]
 ```
 
-`instructions` adds literal text to the selected mode's default guidance; it does not replace that guidance or grant capabilities. Omit it or use an empty string for defaults. Use existing `LANDING_CONFIG` to manage these settings; no separate prompt file is required. Keep shared project rules in `AGENTS.md` and reusable methods in prepared skills. Task evidence and instructions preserve literal `$` expressions; they are not evaluated as templates.
+`instructions` adds guidance without replacing the selected method or granting capabilities. Keep project conventions in `AGENTS.md`, reusable methods in skills, and evidence in task inputs. These additions stay literal rather than being evaluated as templates.
 
-Same-named skill overrides resolve before filtering. Effective capabilities are the intersection of discovered or registered capabilities, the mode allow list, and any per-call allow list, minus the mode exclusions. Omitted or `null` allow lists are unrestricted; `[]` disables the collection. `excluded_tools` and `excluded_skills` default to empty lists and remove matching capabilities even when allowed. Allow and exclude lists accept native tool names or aliases such as `fs.read` and `fs_read`; skill names are case-insensitive and must exist in the discovered roots. Include `skill` for tool-loaded skills, `spill.read` for oversized output, `decide` for gate recommendations, and `no_update` for quiet issuer completion. GitHub publication normally needs `bash` and authenticated gh; inline reply confirmation also needs `confirm_reply`.
+Same-named skill overrides resolve before filtering. Capabilities follow this rule:
 
-Landing ships `landing-issuer`, `landing-fixer`, `landing-gatekeeper`, and `landing-explainer`. Each mode automatically uses its corresponding skill when permitted. Include that name in mode and per-call allow lists to retain its guidance; excluding it or setting `allowed_skills: []` disables the method without changing the mode, checks, or publication requirements. A same-named skill in a higher-priority root replaces the bundled method.
+```text
+Available capabilities ∩ Mode allow list ∩ Per-call allow list − Mode exclusions
+```
 
-Per-call SDK selections intersect with mode limits and cannot expand them. Settings apply to CLI, HTTP, SDK, hooks, and CI. Allowing a skill grants no tools, and allowing tools does not load a skill; skill metadata cannot expand these limits. `,mode` selects a mode without calling the model or adding capabilities.
+Omitted or `null` allow lists are unrestricted; `[]` disables the collection. Exclusions default to empty lists and win over allow lists. Tool lists accept native names or aliases such as `fs.read` and `fs_read`; skill names are case-insensitive. Per-call SDK limits can narrow mode settings but cannot expand them.
 
-These filters control method loading and model tool calls. They do not authorize commands or publishing, isolate the filesystem, disable configured checks, or erase conversation history. An excluded skill can still appear by name in the skill listing, but loading it is denied. Shell and delegation tools may expose broader authority; enforce isolation and publishing permissions in the execution environment.
+Each mode automatically uses its permitted `landing-{mode}` skill. Include that name in allow lists to retain its method. Excluding it disables the method while preserving the mode, checks, and publication requirements. A same-named skill in a higher-priority root replaces it. Allowing a skill grants no tools.
+
+Include `skill` to load supplementary skills, `spill.read` for oversized output, `decide` for review recommendations, and `no_update` for quiet issuer completion. GitHub publication normally requires `bash` and authenticated gh; inline replies also require `confirm_reply`.
+
+Filters control method loading and model tool calls across entry points. They do not grant publishing authority, isolate the filesystem, disable required checks, or erase history. Excluded skills may appear in the listing but cannot load. Enforce permissions and isolation in tools and the execution environment.
 
 ## MCP servers
 
@@ -101,12 +107,11 @@ Discovered tools use names such as `mcp.playwright_browser_navigate`. Existing `
 | Variable | Contract |
 | --- | --- |
 | `LANDING_DB` | SQLite path, default `~/.local/share/landing/landing.sqlite3`; image default `/storage/landing.sqlite3`. |
-| `LANDING_SERVER` | Remote CLI service URL. |
-| `LANDING_TOKEN` | Server and client bearer token; required to listen beyond localhost. |
+| `LANDING_TOKEN` | Server bearer token; required to listen beyond localhost. |
 | `LANDING_GITHUB_REPOSITORY` | Prepared gh repository context. |
 | `LANDING_BASE_URL` | Public HTTP(S) origin for pagination; no credentials, path, query, or fragment. `BASE_URL` remains an alias. |
 
-CLI and service settings read their own fields from environment, Landing YAML and existing Bub YAML. YAML keys are `db`, `server`, `token`, `github_repository` and `base_url`. CLI options override corresponding settings. SDK calls do not validate CLI settings; remote clients do not validate model or MCP settings. MCP settings load when a task prepares its tools, and configuration errors remain visible in its action record.
+CLI and service settings read their own fields from environment, Landing YAML and existing Bub YAML. YAML keys are `db`, `token`, `github_repository` and `base_url`. CLI options override corresponding settings. SDK calls do not validate CLI settings. MCP settings load when a task prepares its tools, and configuration errors remain visible in its action record.
 
 Local workspace defaults to the current directory. Servers register names with `serve --workspace NAME=PATH`.
 

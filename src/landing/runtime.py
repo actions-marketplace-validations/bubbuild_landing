@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-import fcntl
 import json
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from pathlib import Path
@@ -67,6 +66,8 @@ def task_prompt(request: ActionRequest, checks: list[dict]) -> list[dict]:
 class Runtime:
     tasks: Tasks
     store: SQLiteTapeStore
+    execution: asyncio.Lock
+    pending: asyncio.Event
 
     def __init__(
         self,
@@ -91,7 +92,7 @@ class Runtime:
             skill_dirs=(),
         )
         self.active: dict[str, asyncio.Task[Action]] = {}
-        self.execution = asyncio.Lock()
+        self.worker_task: asyncio.Task[None] | None = None
 
     def workspace(self, request: ActionRequest) -> Path:
         if self.workspaces is None:
@@ -108,28 +109,32 @@ class Runtime:
         return path
 
     @contextlib.asynccontextmanager
-    async def running(self) -> AsyncIterator["Runtime"]:
-        # A process-wide worker owns this database. Read-only CLI queries need no lock.
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a+b") as owner:
+    async def running(self, *, background: bool = False) -> AsyncIterator["Runtime"]:
+        """Run work within Bub's resources, stopping execution before they close."""
+        async with self.framework.running():
+            self.worker_task = asyncio.create_task(self.worker()) if background else None
             try:
-                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                message = "Another worker owns this database. Use --server or a different --db."
-                raise ValueError(message) from exc
-            try:
-                async with self.framework.running():
-                    self.tasks.recover()
-                    monitor = asyncio.create_task(self.watch_cancellations())
-                    try:
-                        yield self
-                    finally:
-                        monitor.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await monitor
-                        await self.stop()
+                yield self
             finally:
-                fcntl.flock(owner, fcntl.LOCK_UN)
+                await self.stop()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(self, app: object) -> AsyncIterator[None]:
+        """ASGI lifespan callback that owns background execution."""
+        async with self.running(background=True):
+            yield
+
+    def submit(
+        self, request: ActionRequest, *, scope: str = "sdk", key: str | None = None, retry_of: str | None = None
+    ) -> tuple[Action, bool]:
+        """Persist work for a running background host and return its receipt."""
+        if self.worker_task is None or self.worker_task.done() or self.worker_task.cancelling():
+            message = "The worker is unavailable."
+            raise RuntimeError(message)
+        self.workspace(request)
+        action, created = self.tasks.create(request, scope=scope, key=key, retry_of=retry_of)
+        self.pending.set()
+        return action, created
 
     async def run(self, request: ActionRequest, *, retry_of: str | None = None) -> Action:
         self.workspace(request)
@@ -174,13 +179,6 @@ class Runtime:
             )
         state.pop("landing_pending_action")
         return await self._wait(action.id, state=state)
-
-    async def watch_cancellations(self) -> None:
-        while True:
-            for action_id, task in tuple(self.active.items()):
-                if not task.done() and not task.cancelling() and self.tasks.get(action_id).cancel_requested_at:
-                    task.cancel()
-            await asyncio.sleep(0.1)
 
     async def checks(self, action_id: str, request: ActionRequest, workspace: Path) -> list[dict]:
         results = []
@@ -363,22 +361,19 @@ class Runtime:
         return action
 
     async def worker(self) -> None:
-        try:
-            while True:
-                action_id = self.tasks.next()
-                if action_id is None:
-                    await asyncio.sleep(0.1)
-                    continue
+        while True:
+            self.pending.clear()
+            while (action_id := self.tasks.next()) is not None:
                 try:
                     await self._wait(action_id, cancel_on_interrupt=False)
                 except asyncio.CancelledError:
                     if (parent := asyncio.current_task()) and parent.cancelling():
                         raise
-        finally:
-            await self.stop()
+            await self.pending.wait()
 
     async def stop(self) -> None:
-        for task in self.active.values():
-            if not task.done():
+        tasks = [*self.active.values(), *([self.worker_task] if self.worker_task is not None else [])]
+        for task in tasks:
+            if not task.done() and not task.cancelling():
                 task.cancel()
-        await asyncio.gather(*self.active.values(), return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
