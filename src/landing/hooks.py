@@ -1,6 +1,7 @@
 """Bub hooks adapt Landing's business state and execution to the message pipeline."""
 
 import asyncio
+from importlib.metadata import distribution
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,12 +24,26 @@ if TYPE_CHECKING:
 class LandingHooks(BuiltinImpl):
     """Native defaults and business hooks shared by hook and SDK calls."""
 
-    def __init__(self, runtime: "Runtime") -> None:
-        super().__init__(runtime.framework)
-        self.runtime = runtime
+    runtime: "Runtime"
 
-    def _get_agent(self, state=None):
-        return self.runtime
+    def __init__(self, framework) -> None:
+        super().__init__(framework)
+        for entry in distribution("landing").entry_points.select(group="landing.adapters"):
+            framework.plugin_manager.register(entry.load(), name=entry.name)
+
+    @hookimpl
+    def register_cli_commands(self, app):
+        from landing import cli
+
+        for name, help_text in {
+            "triage": "Identify a problem and its acceptance criteria.",
+            "fix": "Repair the delegated problem and validate changes.",
+            "review": "Evaluate a candidate against independent evidence.",
+            "explain": "Explain the supplied question or evidence.",
+        }.items():
+            app.command(name=name, cls=cli.Command, help=help_text)(cli.delegate)
+        app.add_typer(cli.actions, name="action")
+        app.command(cls=cli.Command)(cli.serve)
 
     @hookimpl(trylast=True)
     def provide_environment(self, session_id, workspace):
@@ -79,7 +94,7 @@ class LandingHooks(BuiltinImpl):
             common=COMMON,
             selected=selected,
             mode=skill.body() if skill else "",
-            instructions=self.runtime.configuration.modes.get(selected, ModeSettings()).instructions,
+            instructions=self.runtime.settings.modes.get(selected, ModeSettings()).instructions,
             workspace=workspace,
             repository=self._read_agents_file(state),
         )
@@ -122,13 +137,3 @@ class LandingHooks(BuiltinImpl):
     @hookimpl(specname="provide_tape_sidecar")
     def task_sidecar(self):
         return self.runtime.tasks
-
-
-def install_hooks(runtime: "Runtime") -> None:
-    """Compose native defaults, business hooks, and storage through Bub's SDK."""
-    manager = runtime.framework.plugin_manager
-    builtin = manager.get_plugin("builtin")
-    if type(builtin) is BuiltinImpl:
-        manager.unregister(builtin)
-    hooks = LandingHooks(runtime)
-    manager.register(hooks, name="landing")

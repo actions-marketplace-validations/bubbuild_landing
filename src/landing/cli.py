@@ -5,24 +5,30 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import os
+import shlex
 import sys
-from collections.abc import Callable, Coroutine
+import time
 from contextlib import nullcontext
 from importlib.metadata import version
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, cast
 
 import typer
-from pydantic import AliasChoices, Field, ValidationError
+from bub import BubFramework
+from pydantic import AliasChoices, Field
 from pydantic_settings import SettingsConfigDict
+from typer.core import TyperCommand
 
-from landing.adapters.github import app as github_app
 from landing.commands import COMMANDS
 from landing.database import open_database, own_database
-from landing.models import TERMINAL, Action, ActionRequest, FileInput
-from landing.settings import FileSettings
+from landing.hooks import LandingHooks
+from landing.models import TERMINAL, Action, ActionRequest, FileInput, Input
+from landing.runtime import Runtime
+from landing.settings import ConfigurationFile, FileSettings
 from landing.tasks import Tasks
+
+DEFAULT_DATABASE = Path("~/.local/share/landing/landing.sqlite3")
 
 
 class ExecutionSettings(FileSettings):
@@ -35,19 +41,51 @@ class ExecutionSettings(FileSettings):
     token: str | None = Field(default=None, repr=False)
     github_repository: str | None = None
     base_url: str | None = Field(default=None, validation_alias=AliasChoices("LANDING_BASE_URL", "BASE_URL"))
+    replicate: bool = False
 
-
-app = typer.Typer(
-    help="Explain CI failures, delegate fixes, and review evidence.",
-    no_args_is_help=True,
-    rich_markup_mode=None,
-    context_settings={"help_option_names": ["-h", "--help"]},
-)
-actions = typer.Typer(help="Inspect and control recorded actions.", no_args_is_help=True)
 
 JsonOutput = Annotated[bool, typer.Option("--json", help="Print records as JSON.")]
 Limit = Annotated[int, typer.Option(min=1, max=100, help="Maximum records to return.")]
 ActionId = Annotated[str, typer.Argument(metavar="ID")]
+actions = typer.Typer(help="Inspect and control recorded actions.", no_args_is_help=True)
+
+
+class Command(TyperCommand):
+    """Present execution errors using Typer's parsed command context."""
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except typer.Exit:
+            raise
+        except (ValueError, OSError, KeyError, RuntimeError) as exc:
+            code = 1 if isinstance(exc, RuntimeError) else 2
+            message = str(exc)
+            if code == 2 and ctx.params.get("json_output", False):
+                typer.echo(json.dumps({"error": {"code": "invalid_request", "message": message}}))
+            typer.echo(message, err=True)
+            raise typer.Exit(code) from exc
+
+
+def execution_settings(ctx: typer.Context) -> ExecutionSettings:
+    parameters = ctx.find_root().params
+    return ExecutionSettings(**{name: value for name, value in parameters.items() if value is not None})
+
+
+def host_runtime(ctx: typer.Context) -> Runtime | None:
+    if (framework := ctx.find_object(BubFramework)) and isinstance(
+        hooks := framework.plugin_manager.get_plugin("builtin"), LandingHooks
+    ):
+        return cast(Runtime | None, hooks._agent)
+    return None
+
+
+def execution_runtime(ctx: typer.Context, settings: ExecutionSettings, *, database: Path | None = None) -> Runtime:
+    return host_runtime(ctx) or Runtime(
+        database or settings.db or DEFAULT_DATABASE,
+        skill_dirs=ctx.find_root().params.get("skill_dir") or (),
+        framework=ctx.find_object(BubFramework),
+    )
 
 
 def show_version(value: bool) -> None:
@@ -56,23 +94,69 @@ def show_version(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
 def configure(
-    ctx: typer.Context,
     db: Annotated[Path | None, typer.Option(help="Local SQLite path; overrides LANDING_DB.")] = None,
     skill_dir: Annotated[list[Path] | None, typer.Option(help="Additional trusted skill root (repeatable).")] = None,
-    github_repository: Annotated[
-        str | None,
-        typer.Option(help="Repository context for the prepared gh CLI."),
-    ] = None,
+    github_repository: Annotated[str | None, typer.Option(help="Repository context for the prepared gh CLI.")] = None,
     version: Annotated[
         bool,
         typer.Option("--version", callback=show_version, is_eager=True, help="Print the installed version and exit."),
     ] = False,
 ) -> None:
-    ctx.ensure_object(dict)
-    ctx.obj.update(db=db, skill_dir=skill_dir or [], github_repository=github_repository)
-    ctx.obj.update(command=ctx.invoked_subcommand, execute=execute)
+    """Configure this invocation without starting execution resources."""
+
+
+def create_cli_app() -> typer.Typer:
+    framework = BubFramework(config_file=ConfigurationFile().config_file.expanduser())
+    framework.plugin_manager.register(LandingHooks(framework), name="builtin")
+    app = typer.Typer(
+        name="landing",
+        help="Explain CI failures, delegate fixes, and review evidence.",
+        callback=configure,
+        no_args_is_help=True,
+        rich_markup_mode=None,
+        context_settings={"obj": framework, "help_option_names": ["-h", "--help"]},
+    )
+    framework.plugin_manager.hook.register_cli_commands(app=app)
+    return app
+
+
+def display(value, *, json_output: bool = False, output: Path | None = None) -> None:
+    if json_output:
+        data = [item.model_dump() for item in value] if isinstance(value, list) else value.model_dump()
+        text = json.dumps(data, indent=2)
+    elif isinstance(value, list):
+        text = "ID\tMODE\tSTATUS\tUPDATED\tINSTRUCTION\n" + "\n".join(
+            f"{item.id}\t{item.mode}\t{item.status}\t{item.updated_at}\t{(item.instruction or '')[:60]}"
+            for item in value
+        )
+    else:
+        text = value.result or f"{value.id}: {value.status}"
+        if value.error:
+            text += "\n" + value.error["message"]
+    typer.echo(text)
+    if output:
+        output.write_text(text + "\n", encoding="utf-8")
+
+
+async def delegate_action(ctx: typer.Context, request: ActionRequest | str) -> Action:
+    settings = execution_settings(ctx)
+    runtime = execution_runtime(ctx, settings)
+    async with runtime.running():
+        retry_of = None
+        if isinstance(request, str):
+            retry_of = request
+            request = runtime.tasks.request(request)
+        request = request.model_copy(update={"workspace": runtime.workspace_name(runtime.workspace(request.workspace))})
+        if repository := settings.github_repository:
+            from landing.adapters.github import repository_context
+
+            context = repository_context(repository)
+            if context not in request.input:
+                request = request.model_copy(update={"input": [*request.input, context]})
+        if retry_of:
+            return await runtime.run(request, retry_of=retry_of)
+        return await runtime.command(cast(str, ctx.info_name), request)
 
 
 def delegate(
@@ -87,166 +171,99 @@ def delegate(
     ] = None,
     json_output: JsonOutput = False,
     output: Annotated[Path | None, typer.Option(help="Also write the result to this file.")] = None,
-) -> NoReturn:
-    execute(**locals())
+) -> None:
+    if (input_files or []).count("-") > 1:
+        message = "stdin can only be used once."
+        raise ValueError(message)
+    inputs: list[Input] = [
+        FileInput(
+            name="stdin" if name == "-" else Path(name).name,
+            media_type=mimetypes.guess_type(name)[0] or "text/plain",
+            content=sys.stdin.read() if name == "-" else Path(name).read_text(encoding="utf-8"),
+        )
+        for name in input_files or []
+    ]
+    request = ActionRequest(
+        mode=COMMANDS[cast(str, ctx.info_name)],
+        instruction=instruction,
+        input=inputs,
+        workspace=workspace,
+        checks=check or [],
+    )
+    action = asyncio.run(delegate_action(ctx, request))
+    display(action, json_output=json_output, output=output)
+    raise typer.Exit(action.exit_code())
 
 
-for name, help_text in {
-    "triage": "Identify a problem and its acceptance criteria.",
-    "fix": "Repair the delegated problem and validate changes.",
-    "review": "Evaluate a candidate against independent evidence.",
-    "explain": "Explain the supplied question or evidence.",
-}.items():
-    app.command(name=name, help=help_text)(delegate)
+def action_database(ctx: typer.Context) -> Path:
+    if runtime := host_runtime(ctx):
+        return runtime.path
+    return (execution_settings(ctx).db or DEFAULT_DATABASE).expanduser()
 
 
-@actions.command("list")
+@actions.command("list", cls=Command)
 def list_actions(
     ctx: typer.Context, limit: Limit = 50, cursor: str | None = None, json_output: JsonOutput = False
-) -> NoReturn:
-    execute(**locals())
+) -> None:
+    with open_database(action_database(ctx)) as engine:
+        display(Tasks(engine).list(limit, cursor), json_output=json_output)
 
 
-@actions.command("logs")
+@actions.command(cls=Command)
 def logs(
     ctx: typer.Context,
     action_id: ActionId,
     after: Annotated[int, typer.Option(min=0, help="Return events after this cursor.")] = 0,
     limit: Limit = 50,
     json_output: JsonOutput = False,
-) -> NoReturn:
-    execute(**locals())
+) -> None:
+    with open_database(action_database(ctx)) as engine:
+        display(Tasks(engine).events(action_id, after, limit), json_output=True)
 
 
-def inspect_action(ctx: typer.Context, action_id: ActionId, json_output: JsonOutput = False) -> NoReturn:
-    execute(**locals())
+def inspect_action(ctx: typer.Context, action_id: ActionId, json_output: JsonOutput = False) -> None:
+    with (
+        own_database(action_database(ctx)) if ctx.info_name == "cancel" else nullcontext(),
+        open_database(action_database(ctx)) as engine,
+    ):
+        tasks = Tasks(engine)
+        action = tasks.get(action_id)
+        if ctx.info_name == "cancel":
+            if action.status == "running":
+                message = "This action needs recovery by its executing host."
+                raise ValueError(message)
+            action = tasks.cancel(action_id)
+        display(action, json_output=json_output)
 
 
-actions.command("view", help="Read an action's status and result.")(inspect_action)
-actions.command("cancel", help="Cancel queued work while its host is stopped.")(inspect_action)
+actions.command("view", cls=Command, help="Read an action's status and result.")(inspect_action)
+actions.command("cancel", cls=Command, help="Cancel queued work while its host is stopped.")(inspect_action)
 
 
-@actions.command()
+@actions.command(cls=Command)
 def watch(
     ctx: typer.Context,
     action_id: ActionId,
     exit_status: Annotated[bool, typer.Option(help="Use the action's completion and gate exit code.")] = False,
     json_output: JsonOutput = False,
-) -> NoReturn:
+) -> None:
     """Wait for an action to finish."""
-    execute(**locals())
+    with open_database(action_database(ctx)) as engine:
+        tasks = Tasks(engine)
+        while (action := tasks.get(action_id)).status not in TERMINAL:
+            time.sleep(1)
+        display(action, json_output=json_output)
+        raise typer.Exit(action.exit_code() if exit_status else 0)
 
 
-@actions.command()
-def retry(
-    ctx: typer.Context,
-    action_id: ActionId,
-    json_output: JsonOutput = False,
-) -> NoReturn:
+@actions.command(cls=Command)
+def retry(ctx: typer.Context, action_id: ActionId, json_output: JsonOutput = False) -> None:
     """Retry a terminal action using its original request."""
-    execute(**locals())
+    action = asyncio.run(delegate_action(ctx, action_id))
+    display(action, json_output=json_output)
+    raise typer.Exit(action.exit_code())
 
 
-def database(args) -> Path:
-    return (args.db or Path("~/.local/share/landing/landing.sqlite3")).expanduser()
-
-
-def build_request(args) -> ActionRequest:
-    if (args.input_files or []).count("-") > 1:
-        message = "stdin can only be used once."
-        raise ValueError(message)
-    inputs = []
-    for name in args.input_files or []:
-        content = sys.stdin.read() if name == "-" else Path(name).read_text(encoding="utf-8")
-        inputs.append(
-            FileInput(
-                name="stdin" if name == "-" else Path(name).name,
-                media_type=mimetypes.guess_type(name)[0] or "text/plain",
-                content=content,
-            )
-        )
-    workspace = str(Path(args.workspace or ".").expanduser().resolve())
-    return ActionRequest(
-        mode=COMMANDS[args.command],
-        instruction=args.instruction,
-        input=inputs,
-        workspace=workspace,
-        checks=args.check or [],
-    )
-
-
-def display(value, args) -> None:
-    data = [item.model_dump() for item in value] if isinstance(value, list) else value.model_dump()
-    if args.json_output or getattr(args, "operation", None) == "logs":
-        text = json.dumps(data, indent=2)
-    elif isinstance(value, list):
-        text = "ID\tMODE\tSTATUS\tUPDATED\tINSTRUCTION\n" + "\n".join(
-            f"{item.id}\t{item.mode}\t{item.status}\t{item.updated_at}\t{(item.instruction or '')[:60]}"
-            for item in value
-        )
-    else:
-        text = value.result or f"{value.id}: {value.status}"
-        if value.error:
-            text += "\n" + value.error["message"]
-    print(text)
-    if output := getattr(args, "output", None):
-        output.write_text(text + "\n", encoding="utf-8")
-
-
-async def wait(action_id: str, tasks: Tasks) -> Action:
-    while True:
-        action = tasks.get(action_id)
-        if action.status in TERMINAL:
-            return action
-        await asyncio.sleep(1)
-
-
-async def local(args) -> int:
-    from landing.runtime import Runtime
-
-    if args.command == "action" and args.operation != "retry":
-        with (
-            own_database(database(args)) if args.operation == "cancel" else nullcontext(),
-            open_database(database(args)) as engine,
-        ):
-            tasks = Tasks(engine)
-            if args.operation == "list":
-                display(tasks.list(args.limit, args.cursor), args)
-            elif args.operation == "logs":
-                display(tasks.events(args.action_id, args.after, args.limit), args)
-            elif args.operation == "cancel":
-                if tasks.get(args.action_id).status == "running":
-                    message = "This action needs recovery by its executing host."
-                    raise ValueError(message)
-                display(tasks.cancel(args.action_id), args)
-            elif args.operation == "view":
-                display(tasks.get(args.action_id), args)
-            else:
-                action = await wait(args.action_id, tasks)
-                display(action, args)
-                return action.exit_code() if args.exit_status else 0
-        return 0
-    from landing.adapters.github import repository_context
-
-    runtime = Runtime(
-        database(args),
-        skill_dirs=args.skill_dir,
-    )
-    async with runtime.running():
-        request = build_request(args) if args.command in COMMANDS else runtime.tasks.request(args.action_id)
-        if args.github_repository:
-            context = repository_context(args.github_repository)
-            if context not in request.input:
-                request = request.model_copy(update={"input": [*request.input, context]})
-        if args.command in COMMANDS:
-            action = await runtime.command(args.command, request)
-        else:
-            action = await runtime.run(request, retry_of=args.action_id)
-        display(action, args)
-        return action.exit_code()
-
-
-@app.command()
 def serve(
     ctx: typer.Context,
     host: Annotated[str, typer.Option(help="Listen address.")] = "127.0.0.1",
@@ -254,74 +271,56 @@ def serve(
     workspace: Annotated[
         list[str] | None, typer.Option(metavar="NAME=PATH", help="Register a workspace (repeatable).")
     ] = None,
-) -> NoReturn:
+) -> None:
     """Run the HTTP service with registered workspaces."""
-    execute(**locals())
-
-
-def start_server(args) -> None:
     import uvicorn
 
     from landing.server import create_app
 
-    workspaces = {"default": Path.cwd()}
-    for value in args.workspace or []:
+    settings = execution_settings(ctx)
+    if host not in {"127.0.0.1", "localhost", "::1"} and not settings.token:
+        message = "Set LANDING_TOKEN before listening beyond localhost."
+        raise ValueError(message)
+    embedded = host_runtime(ctx)
+    runtime = embedded or execution_runtime(ctx, settings)
+    workspaces = dict(runtime.workspaces or {"default": runtime.framework.workspace})
+    for value in workspace or []:
         name, separator, path = value.partition("=")
         if not separator or not name or not path:
             message = "Register a workspace as NAME=PATH."
             raise ValueError(message)
         workspaces[name] = Path(path).expanduser().resolve()
-    token = args.token
-    if args.host not in {"127.0.0.1", "localhost", "::1"} and not token:
-        message = "Set LANDING_TOKEN before listening beyond localhost."
-        raise ValueError(message)
-    uvicorn.run(
-        create_app(
-            database(args),
-            workspaces=workspaces,
-            token=token,
-            base_url=args.base_url,
-            github_repository=args.github_repository,
-            skill_dirs=args.skill_dir,
-        ),
-        host=args.host,
-        port=args.port,
+    runtime.workspaces = workspaces
+    app = create_app(
+        runtime,
+        token=settings.token,
+        base_url=settings.base_url,
+        github_repository=settings.github_repository,
     )
-
-
-def execute(
-    ctx: typer.Context, *, handler: Callable[[SimpleNamespace], Coroutine[Any, Any, int]] | None = None, **parameters
-) -> NoReturn:
-    args = SimpleNamespace(**ctx.obj, **parameters, operation=ctx.info_name)
-    try:
-        vars(args).update(
-            ExecutionSettings(**{name: value for name, value in vars(args).items() if value is not None}).model_dump()
+    if settings.replicate:
+        if embedded:
+            message = "Use an external supervisor for an existing SDK host."
+            raise ValueError(message)
+        command = [sys.executable, "-m", "landing", "--github-repository", settings.github_repository or ""]
+        command.extend(["serve", "--host", host, "--port", str(port)])
+        for name, path in workspaces.items():
+            command.extend(["--workspace", f"{name}={path}"])
+        os.execvpe(  # noqa: S606 -- replace the CLI with its native process supervisor.
+            "litestream",  # noqa: S607 -- use Litestream from the prepared host's PATH.
+            ["litestream", "replicate", "-restore-if-db-not-exists", "-exec", shlex.join(command)],
+            {
+                **os.environ,
+                "LANDING_REPLICATE": "false",
+                "LANDING_DB": str(runtime.path),
+                "LANDING_SKILL_DIRS": json.dumps([str(root) for root in runtime.skill_roots]),
+            },
         )
-        if handler is not None:
-            code = asyncio.run(handler(args))
-        elif args.command == "serve":
-            ctx.obj.get("start_server", start_server)(args)
-            code = 0
-        else:
-            code = asyncio.run(local(args))
-    except (ValueError, ValidationError, OSError, KeyError) as exc:
-        if getattr(args, "json_output", False):
-            print(json.dumps({"error": {"code": "invalid_request", "message": str(exc)}}))
-        typer.echo(str(exc), err=True)
-        code = 2
-    except RuntimeError as exc:
-        typer.echo(str(exc), err=True)
-        code = 1
-    raise typer.Exit(code)
-
-
-app.add_typer(actions, name="action")
-app.add_typer(github_app)
+    uvicorn.run(app, host=host, port=port)
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        app(args=argv, prog_name="landing")
+        create_cli_app()(args=argv, prog_name="landing")
     except SystemExit as exc:
         return int(exc.code or 0)
     return 0

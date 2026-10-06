@@ -2,7 +2,7 @@
 
 Use one `Runtime` to execute actions, stream events, or submit background work. It shares action semantics with CLI and HTTP. Enter its lifecycle before calling it; leaving the context stops owned execution and releases the database. The same Runtime can enter a new lifecycle and resume its stored work.
 
-This reference covers the source checkout, including `submit()` and `lifespan()`, which are unavailable in release `0.2.0`. Install that checkout into your application with `uv add /path/to/landing` and configure the [model](configuration.md#model).
+This reference covers the source checkout, including `submit()`, `lifespan()`, and `Runtime.run_stream()`, which are unavailable in release `0.2.0`. Migrate streaming calls from `landing.agent.run_stream(...)` in `0.2.0` to `landing.run_stream(...)`. Install that checkout into your application with `uv add /path/to/landing` and configure the [model](configuration.md#model).
 
 ## Delegate an action
 
@@ -41,7 +41,7 @@ landing = Runtime(Path("landing.sqlite3"))
 app = FastAPI(lifespan=landing.lifespan)
 ```
 
-Call `action, created = landing.submit(request)` from your handlers to persist work and return a receipt. Optional `scope` and `key` deduplicate deliveries; `retry_of` retries terminal work. Read `landing.tasks.get(action.id)` when needed and call `landing.cancel(action.id)` to cancel. Caller disconnection leaves accepted work running; application shutdown interrupts active work and preserves the queue.
+Use `create_app(landing)` to serve Landing's complete HTTP API with that same Runtime and its configured workspaces and skills. Call `action, created = landing.submit(request)` from your handlers to persist work and return a receipt. Optional `scope` and `key` deduplicate deliveries; `retry_of` retries terminal work. Read `landing.tasks.get(action.id)` when needed and call `landing.cancel(action.id)` to cancel. Caller disconnection leaves accepted work running; application shutdown interrupts active work and preserves the queue.
 
 For another host, enter `landing.running(background=True)`. Ordinary `running()` executes only delegated calls and leaves existing queued work untouched. Submission requires a live background host.
 
@@ -79,7 +79,7 @@ Use `,triage`, `,fix`, `,review`, or `,explain` to delegate work. `,mode` reads 
 
 ## Hook integration
 
-Pass an existing Bub framework to handle Landing commands through your application's message pipeline:
+Use Landing's `Runtime` as your Bub framework's agent, with Landing-owned model configuration and execution. Create it at application startup, then add host hooks for the message pipeline:
 
 ```python
 from pathlib import Path
@@ -100,7 +100,7 @@ async def handle():
         ))
 ```
 
-Landing registers resources and task execution with the framework. The message host stops its tasks before leaving the framework context; host hooks handle state, rendering, and delivery. Landing supplies task guidance. Set `framework.workspace` before entering its lifecycle to select the message host's default workspace. Mode and history remain isolated by workspace and session. Tools and checks use the environment supplied in state, or execute locally in the selected workspace. Host environment hooks receive the framework's workspace; Bub caches their environment per session and closes it at shutdown.
+Landing registers resources, task execution, and CLI commands with the framework. `framework.create_cli_app()` retains the host's Runtime, database, workspace, and hooks when running Landing commands. The message host stops its tasks before leaving the framework context; host hooks handle state, rendering, and delivery. Landing supplies task guidance. Set `framework.workspace` before entering its lifecycle to select the message host's default workspace. Mode and history remain isolated by workspace and session. Tools and checks use the environment supplied in state, or execute locally in the selected workspace. Host environment hooks receive the framework's workspace; Bub caches their environment per session and closes it at shutdown.
 
 ## Skills and additional tools
 

@@ -1,6 +1,5 @@
 """Native agent publication and event admission through a prepared gh executable."""
 
-import asyncio
 import json
 import os
 
@@ -8,9 +7,8 @@ import pytest
 from typer.testing import CliRunner
 
 from landing.adapters import github
-from landing.cli import app
+from landing.cli import create_cli_app
 from landing.models import Action
-from landing.tasks import ConflictError
 from tests.conftest import completion
 
 
@@ -71,8 +69,7 @@ elif "/comments/" in endpoint:
     print(json.dumps(record))
 elif endpoint.endswith("/reviews") or endpoint.endswith("/comments"):
     kind = endpoint.rsplit("/", 1)[-1]
-    for record in state[kind]:
-        print(json.dumps(record))
+    print(json.dumps([state[kind]] if "--slurp" in args else state[kind]))
 else:
     print(json.dumps({**state.get("target", {}), "head": {"sha": state.get("head", "candidate-head")}}))
 """)
@@ -117,7 +114,7 @@ def invoke(tmp_path, platform, monkeypatch):
             "INPUT_UPSTREAM_WORKFLOW": "release-main",
         }.items():
             monkeypatch.setenv(name, value)
-        result = CliRunner().invoke(app, ["github", "event"])
+        result = CliRunner().invoke(create_cli_app(), ["github", "event"])
         if error:
             assert result.exit_code != 0
             assert error in result.stderr
@@ -133,7 +130,12 @@ def invoke(tmp_path, platform, monkeypatch):
     return call
 
 
-def test_comment_actions_require_maintainer_and_use_configurable_identity(platform, invoke, model):
+def test_comment_actions_require_maintainer_and_use_configurable_identity(
+    tmp_path, platform, invoke, model, monkeypatch
+):
+    config = tmp_path / "landing.yml"
+    config.write_text("model: [invalid]")
+    monkeypatch.setenv("LANDING_CONFIG", str(config))
     event = {
         "repository": {"full_name": "example/landing"},
         "issue": {"number": 42},
@@ -142,6 +144,7 @@ def test_comment_actions_require_maintainer_and_use_configurable_identity(platfo
     event["comment"]["body"] = "Handled the task."
     assert invoke(event) is None
     assert not model[1]
+    config.unlink()
     event["comment"]["body"] = "/landing fix Repair retry behavior."
     event["comment"]["user"] = {"type": "User", "login": "contributor"}
     state = json.loads(platform.read_text())
@@ -183,7 +186,7 @@ def test_comment_actions_require_maintainer_and_use_configurable_identity(platfo
     invoke(event, error="Choose")
 
 
-def test_agent_publishes_native_review_with_inline_comment_and_deduplicates(tmp_path, platform, model):
+def test_agent_publishes_native_review_with_inline_comment_and_deduplicates(platform, invoke, model, monkeypatch):
     responses, requests = model
     stamp = github.marker("gatekeeper", "review:42")
     review = {
@@ -203,20 +206,13 @@ def test_agent_publishes_native_review_with_inline_comment_and_deduplicates(tmp_
         completion("Published the retry finding on the candidate."),
     ])
 
-    async def run(instruction="Review retry behavior."):
-        return await github.run(
-            "example/landing",
-            "review",
-            instruction,
-            tmp_path / "landing.sqlite3",
-            tmp_path,
-            number=42,
-            head="candidate-head",
-            key="review:42",
-            checks=["true"],
-        )
-
-    action = asyncio.run(run())
+    event = {
+        "repository": {"full_name": "example/landing"},
+        "sender": {"type": "User", "login": "maintainer"},
+        "pull_request": {"number": 42, "head": {"sha": "candidate-head"}},
+    }
+    monkeypatch.setenv("INPUT_CHECKS", "true")
+    action = invoke(event, key="review:42")
     assert action.status == "completed"
     assert action.decision == "block"
     published = json.loads(platform.read_text())["reviews"]
@@ -228,11 +224,11 @@ def test_agent_publishes_native_review_with_inline_comment_and_deduplicates(tmp_
     state["reviews"].append({"id": 9, "body": "A later independent review.", "state": "COMMENTED"})
     platform.write_text(json.dumps(state))
     calls = len(requests)
-    assert asyncio.run(run()).id == action.id
+    assert invoke(event, key="review:42").id == action.id
     assert len(requests) == calls
     assert json.loads(platform.read_text())["reviews"] == state["reviews"]
-    with pytest.raises(ConflictError, match="different request"):
-        asyncio.run(run("Review deployment behavior."))
+    monkeypatch.setenv("INPUT_INSTRUCTION", "Review deployment behavior.")
+    invoke(event, key="review:42", error="different request")
 
 
 @pytest.mark.parametrize("foreign", [False, True])
@@ -367,7 +363,7 @@ def test_delegated_inline_reply_is_confirmed_and_replay_does_not_publish_twice(p
     assert invoke(event, key="status-update") is None
 
 
-def test_text_without_required_publication_is_failed_work(tmp_path, platform, model):
+def test_text_without_required_publication_is_failed_work(platform, invoke, model):
     state = json.loads(platform.read_text())
     state["reviews"].append({
         "id": 1,
@@ -380,19 +376,12 @@ def test_text_without_required_publication_is_failed_work(tmp_path, platform, mo
     platform.write_text(json.dumps(state))
     responses, _ = model
     responses.append(completion("The review is ready."))
-    action = asyncio.run(
-        github.run(
-            "example/landing",
-            "review",
-            "Review the candidate.",
-            tmp_path / "landing.sqlite3",
-            tmp_path,
-            number=42,
-            head="candidate-head",
-            key="missing-review",
-            checks=[],
-        )
-    )
+    event = {
+        "repository": {"full_name": "example/landing"},
+        "sender": {"type": "User", "login": "maintainer"},
+        "pull_request": {"number": 42, "head": {"sha": "candidate-head"}},
+    }
+    action = invoke(event, key="missing-review")
     assert action.status == "failed"
     assert action.result == "The review is ready."
     assert action.error is not None
@@ -401,7 +390,7 @@ def test_text_without_required_publication_is_failed_work(tmp_path, platform, mo
 
 
 @pytest.mark.parametrize("lookup_fails", [False, True])
-def test_review_stops_queued_tools_for_superseded_or_unverifiable_head(tmp_path, platform, model, lookup_fails):
+def test_review_stops_queued_tools_for_superseded_or_unverifiable_head(tmp_path, platform, invoke, model, lookup_fails):
     responses, requests = model
     state = json.loads(platform.read_text())
     state["head"] = "new-candidate"
@@ -431,26 +420,17 @@ def test_review_stops_queued_tools_for_superseded_or_unverifiable_head(tmp_path,
         completion("Published the original candidate review."),
     ])
 
-    async def run():
-        return await github.run(
-            "example/landing",
-            "review",
-            "Review the candidate.",
-            tmp_path / "landing.sqlite3",
-            tmp_path,
-            number=42,
-            head="candidate-head",
-            key="superseded",
-            checks=[],
-        )
-
-    with pytest.raises(ValueError, match="PR head changed"):
-        asyncio.run(run())
+    event = {
+        "repository": {"full_name": "example/landing"},
+        "sender": {"type": "User", "login": "maintainer"},
+        "pull_request": {"number": 42, "head": {"sha": "candidate-head"}},
+    }
+    invoke(event, key="superseded", error="PR head changed")
     assert not requests
     assert not json.loads(platform.read_text())["reviews"]
     state["head"] = "candidate-head"
     platform.write_text(json.dumps(state))
-    action = asyncio.run(run())
+    action = invoke(event, key="superseded")
     assert action.status == "cancelled"
     assert not json.loads(platform.read_text())["reviews"]
     assert not (tmp_path / "review.json").exists()
