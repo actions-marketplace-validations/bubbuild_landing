@@ -3,8 +3,11 @@ import threading
 import time
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from landing.models import ActionRequest
+from landing.runtime import Runtime
 from landing.server import create_app
 from tests.conftest import completion
 
@@ -76,6 +79,45 @@ def test_admission_rejects_invalid_requests_without_tasks(tmp_path, model):
         assert client.get("/v1/actions").json() == []
 
 
+def test_embedded_application_uses_landing_lifespan(tmp_path, model):
+    responses, _ = model
+    started = threading.Event()
+    release = threading.Event()
+
+    async def blocked(**kwargs):
+        started.set()
+        await asyncio.to_thread(release.wait, 5)
+        return completion("Explained for the embedding application.")
+
+    responses.extend([blocked, completion("Explained after restarting the application.")])
+    runtime = Runtime(tmp_path / "landing.sqlite3")
+    app = FastAPI(lifespan=runtime.lifespan)
+
+    @app.post("/delegate")
+    async def delegate(body: ActionRequest):
+        action, _ = runtime.submit(body)
+        return action
+
+    @app.get("/actions/{action_id}")
+    async def view(action_id: str):
+        return runtime.tasks.get(action_id)
+
+    with TestClient(app) as client:
+        created = client.post("/delegate", json={"mode": "explainer", "instruction": "Explain the failure."})
+        assert created.status_code == 200
+        assert started.wait(timeout=5)
+        location = "/actions/" + created.json()["id"]
+        assert client.get(location).json()["status"] == "running"
+        release.set()
+        assert wait(client, location)["result"] == "Explained for the embedding application."
+    with TestClient(app) as client:
+        assert client.get(location).json()["status"] == "completed"
+        created = client.post("/delegate", json={"mode": "explainer", "instruction": "Explain the next failure."})
+        assert created.status_code == 200
+        location = "/actions/" + created.json()["id"]
+        assert wait(client, location)["result"] == "Explained after restarting the application."
+
+
 def test_cancellation_and_restart_preserve_work_outcomes(tmp_path, model):
     responses, _ = model
     started = threading.Event()
@@ -121,7 +163,7 @@ def test_once_health_checks_worker_and_database_without_auth(tmp_path):
         assert client.get("/up").json() == {"status": "ok"}
         assert client.get("/v1/actions").status_code == 401
         assert client.portal is not None
-        client.portal.call(app.state.worker.cancel)
+        client.portal.call(app.state.runtime.stop)
         deadline = time.monotonic() + 5
         while client.get("/up").status_code == 200 and time.monotonic() < deadline:
             time.sleep(0.01)
