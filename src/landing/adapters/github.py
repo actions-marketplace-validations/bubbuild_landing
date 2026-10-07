@@ -405,6 +405,56 @@ def pull_target(
     return is_pr, thread, head
 
 
+def reaction_endpoint(repository: str, event: dict | None) -> str | None:
+    """Locate the triggering comment or PR, which receives Landing's progress reaction."""
+    comment = (event or {}).get("comment")
+    if comment:
+        kind = "pulls" if "pull_request_review_id" in comment else "issues"
+        return f"repos/{repository}/{kind}/comments/{comment['id']}/reactions" if "id" in comment else None
+    pull = (event or {}).get("pull_request") or {}
+    return f"repos/{repository}/issues/{pull['number']}/reactions" if "number" in pull else None
+
+
+def react(repository: str, endpoint: str, content: str) -> dict | None:
+    # Reactions only signal progress; a missing reaction permission must not fail the delegated work.
+    try:
+        return json.loads(gh(["api", endpoint, "-f", f"content={content}"], repository))
+    except (RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
+        typer.echo(f"Cannot add the {content} reaction: {exc}", err=True)
+        return None
+
+
+def unreact(repository: str, endpoint: str, reaction: dict) -> None:
+    try:
+        gh(["api", f"{endpoint}/{reaction['id']}", "-X", "DELETE"], repository)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        typer.echo(f"Cannot remove the {reaction['content']} reaction: {exc}", err=True)
+
+
+def begin_reaction(repository: str, endpoint: str) -> dict | None:
+    progress = react(repository, endpoint, "eyes")
+    if progress is None:
+        return None
+    # A new PR candidate replaces the previous run's outcome, so the PR shows only the latest result.
+    try:
+        reactions = rows(endpoint, repository)
+    except (RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
+        typer.echo(f"Cannot read earlier reactions: {exc}", err=True)
+        reactions = []
+    for item in reactions:
+        if item.get("user", {}).get("id") == progress["user"]["id"] and item.get("content") in {"rocket", "confused"}:
+            unreact(repository, endpoint, item)
+    return progress
+
+
+def conclude_reaction(repository: str, endpoint: str, progress: dict | None, status: str) -> None:
+    if progress is not None:
+        unreact(repository, endpoint, progress)
+    # A superseded or terminated run leaves no outcome; the next run reports its own.
+    if status != "cancelled":
+        react(repository, endpoint, "rocket" if status == "completed" else "confused")
+
+
 def checkout_contains(workspace: Path, head: str, checked_revision: str) -> bool | None:
     executable = shutil.which("git")
     if not head or not checked_revision or not executable:
@@ -478,6 +528,10 @@ async def run(landing: Runtime, options: GitHubSettings, event: dict | None = No
         checks=options.check if mode in {"fixer", "gatekeeper"} else [],
     )
 
+    # pull_target has already rejected a stale candidate, so its rejection leaves the current outcome in place.
+    endpoint = reaction_endpoint(repository, event)
+    progress = begin_reaction(repository, endpoint) if endpoint else None
+    status = "failed"
     publication = Publication(landing, repository, number, stamp, expected_review, thread, head, reply_required)
     manager = landing.framework.plugin_manager
     manager.register(publication, name="github-publication")
@@ -492,22 +546,31 @@ async def run(landing: Runtime, options: GitHubSettings, event: dict | None = No
                     request.model_copy(update={"input": snapshot}), scope=repository, key=key
                 )
                 publication.verify(action)
-                return landing.tasks.finish(action.id, "completed", result=f"Already published: {existing['html_url']}")
-            try:
-                action = await landing.run(
-                    request,
-                    session_id=f"github:{number or key}",
-                    scope=repository,
-                    key=key,
-                    verify=publication.verify,
+                action = landing.tasks.finish(
+                    action.id, "completed", result=f"Already published: {existing['html_url']}"
                 )
-            except asyncio.CancelledError:
-                if not publication.action_id:
-                    raise
-                action = landing.tasks.get(publication.action_id)
-            return action
+            else:
+                try:
+                    action = await landing.run(
+                        request,
+                        session_id=f"github:{number or key}",
+                        scope=repository,
+                        key=key,
+                        verify=publication.verify,
+                    )
+                except asyncio.CancelledError:
+                    if not publication.action_id:
+                        raise
+                    action = landing.tasks.get(publication.action_id)
+        status = action.status
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
     finally:
         manager.unregister(publication)
+        if endpoint:
+            conclude_reaction(repository, endpoint, progress, status)
+    return action
 
 
 def write_outputs(action: Action | None) -> None:
