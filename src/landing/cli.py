@@ -9,7 +9,6 @@ import os
 import shlex
 import sys
 import time
-from contextlib import nullcontext
 from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated, cast
@@ -20,13 +19,12 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import SettingsConfigDict
 from typer.core import TyperCommand
 
-from landing.commands import COMMANDS
 from landing.database import open_database, own_database
 from landing.hooks import LandingHooks
-from landing.models import TERMINAL, Action, ActionRequest, FileInput, Input
+from landing.models import COMMANDS, TERMINAL, Action, ActionRequest, FileInput, Input
 from landing.runtime import Runtime
 from landing.settings import ConfigurationFile, FileSettings
-from landing.tasks import Tasks
+from landing.tasks import NotFoundError, Tasks
 
 DEFAULT_DATABASE = Path("~/.local/share/landing/landing.sqlite3")
 
@@ -58,7 +56,7 @@ class Command(TyperCommand):
             return super().invoke(ctx)
         except typer.Exit:
             raise
-        except (ValueError, OSError, KeyError, RuntimeError) as exc:
+        except (ValueError, OSError, NotFoundError, RuntimeError) as exc:
             code = 1 if isinstance(exc, RuntimeError) else 2
             message = str(exc)
             if code == 2 and ctx.params.get("json_output", False):
@@ -74,9 +72,9 @@ def execution_settings(ctx: typer.Context) -> ExecutionSettings:
 
 def host_runtime(ctx: typer.Context) -> Runtime | None:
     if (framework := ctx.find_object(BubFramework)) and isinstance(
-        hooks := framework.plugin_manager.get_plugin("builtin"), LandingHooks
+        hooks := framework.plugin_manager.get_plugin("landing"), LandingHooks
     ):
-        return cast(Runtime | None, hooks._agent)
+        return getattr(hooks, "runtime", None)
     return None
 
 
@@ -108,7 +106,7 @@ def configure(
 
 def create_cli_app() -> typer.Typer:
     framework = BubFramework(config_file=ConfigurationFile().config_file.expanduser())
-    framework.plugin_manager.register(LandingHooks(framework), name="builtin")
+    framework.plugin_manager.register(LandingHooks(framework), name="landing")
     app = typer.Typer(
         name="landing",
         help="Explain CI failures, delegate fixes, and review evidence.",
@@ -149,14 +147,11 @@ async def delegate_action(ctx: typer.Context, request: ActionRequest | str) -> A
             request = runtime.tasks.request(request)
         request = request.model_copy(update={"workspace": runtime.workspace_name(runtime.workspace(request.workspace))})
         if repository := settings.github_repository:
-            from landing.adapters.github import repository_context
+            from landing.adapters.github import with_repository_context
 
-            context = repository_context(repository)
-            if context not in request.input:
-                request = request.model_copy(update={"input": [*request.input, context]})
-        if retry_of:
-            return await runtime.run(request, retry_of=retry_of)
-        return await runtime.command(cast(str, ctx.info_name), request)
+            request = with_repository_context(request, repository)
+        # Each delegation uses its own action session; unrelated CLI calls must not share model history.
+        return await runtime.run(request, retry_of=retry_of, scope="cli")
 
 
 def delegate(
@@ -221,23 +216,22 @@ def logs(
         display(Tasks(engine).events(action_id, after, limit), json_output=True)
 
 
-def inspect_action(ctx: typer.Context, action_id: ActionId, json_output: JsonOutput = False) -> None:
-    with (
-        own_database(action_database(ctx)) if ctx.info_name == "cancel" else nullcontext(),
-        open_database(action_database(ctx)) as engine,
-    ):
+@actions.command(cls=Command)
+def view(ctx: typer.Context, action_id: ActionId, json_output: JsonOutput = False) -> None:
+    """Read an action's status and result."""
+    with open_database(action_database(ctx)) as engine:
+        display(Tasks(engine).get(action_id), json_output=json_output)
+
+
+@actions.command(cls=Command)
+def cancel(ctx: typer.Context, action_id: ActionId, json_output: JsonOutput = False) -> None:
+    """Cancel queued work while its host is stopped."""
+    with own_database(action_database(ctx)), open_database(action_database(ctx)) as engine:
         tasks = Tasks(engine)
-        action = tasks.get(action_id)
-        if ctx.info_name == "cancel":
-            if action.status == "running":
-                message = "This action needs recovery by its executing host."
-                raise ValueError(message)
-            action = tasks.cancel(action_id)
-        display(action, json_output=json_output)
-
-
-actions.command("view", cls=Command, help="Read an action's status and result.")(inspect_action)
-actions.command("cancel", cls=Command, help="Cancel queued work while its host is stopped.")(inspect_action)
+        if tasks.get(action_id).status == "running":
+            message = "This action needs recovery by its executing host."
+            raise ValueError(message)
+        display(tasks.cancel(action_id), json_output=json_output)
 
 
 @actions.command(cls=Command)

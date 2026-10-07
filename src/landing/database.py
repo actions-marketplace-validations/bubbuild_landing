@@ -8,6 +8,8 @@ from typing import cast
 
 from sqlalchemy import URL, Engine, create_engine, event
 
+# Version 1 is the schema released in 0.2.0; raise it when a migration changes the schema.
+SCHEMA_VERSION = 1
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS actions (
     id TEXT PRIMARY KEY NOT NULL,
@@ -55,7 +57,8 @@ CREATE INDEX IF NOT EXISTS tape_entries_history ON tape_entries(tape, id);
 def own_database(path: Path) -> Iterator[None]:
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as owner:
+    # Lock a sibling file: on macOS, flock on the database conflicts with SQLite's own fcntl locks.
+    with path.with_name(path.name + ".lock").open("a+b") as owner:
         try:
             fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -87,9 +90,13 @@ def open_database(path: Path | Engine) -> Iterator[Engine]:
     Path(cast(str, engine.url.database)).parent.mkdir(parents=True, exist_ok=True)
     try:
         with engine.begin() as connection:
+            if connection.exec_driver_sql("PRAGMA user_version").scalar_one() > SCHEMA_VERSION:
+                message = "A newer Landing release created this database. Upgrade Landing to use it."
+                raise ValueError(message)
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     connection.exec_driver_sql(statement)
+            connection.exec_driver_sql(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
         yield engine
     finally:
         engine.dispose()

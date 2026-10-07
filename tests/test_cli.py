@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 
@@ -35,6 +36,28 @@ def test_cli_modes_complete_and_reopen_history(tmp_path, model, capsys, command,
     assert action["mode"] == mode
     assert main(["--db", database, "action", "view", action["id"], "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == action
+
+
+def test_cli_delegations_do_not_share_model_history(tmp_path, model):
+    responses, requests = model
+    responses.extend([completion("The first answer."), completion("The second answer.")])
+    database = str(tmp_path / "landing.sqlite3")
+    assert main(["--db", database, "explain", "Explain the first-task evidence."]) == 0
+    assert main(["--db", database, "fix", "Fix the second problem."]) == 0
+    second = json.dumps(requests[1]["messages"])
+    assert "first-task evidence" not in second
+    assert "The first answer." not in second
+
+
+def test_newer_database_is_left_unchanged(tmp_path, capsys):
+    path = tmp_path / "landing.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 99")
+    assert main(["--db", str(path), "action", "list"]) == 2
+    assert "newer Landing release" in capsys.readouterr().err
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (99,)
+        assert connection.execute("SELECT name FROM sqlite_master").fetchall() == []
 
 
 @pytest.mark.parametrize("decision", ["allow", "block", "inconclusive"])
@@ -75,29 +98,41 @@ def test_cli_reads_piped_evidence_and_writes_json_result(tmp_path, model):
     assert json.loads(destination.read_text())["result"] == "Deployment reference: approved"
 
 
-def test_captured_help_and_diagnostics_remain_plain_in_ci():
-    environment = {**os.environ, "GITHUB_ACTIONS": "true", "FORCE_COLOR": "1"}
-    for arguments, status in (
+def run_in_shell(*arguments: str) -> subprocess.CompletedProcess:
+    return subprocess.run(  # noqa: S603 -- exercise the installed CLI with explicit arguments.
+        ["/bin/bash", "-c", '"$0" "$@" || exit', sys.executable, *arguments],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GITHUB_ACTIONS": "true", "FORCE_COLOR": "1"},
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "status"),
+    [
         (["triage", "--help"], 0),
         (["--show-completion"], 0),
         (["action", "list", "--limit", "0", "--json"], 2),
+    ],
+)
+def test_captured_help_and_diagnostics_remain_plain_in_ci(arguments, status):
+    # Without /proc, shellingham lists processes with ps, which omits processes lacking a terminal (macOS CI).
+    if (
+        "--show-completion" in arguments
+        and run_in_shell("-c", "import shellingham; shellingham.detect_shell()").returncode
     ):
-        result = subprocess.run(  # noqa: S603 -- exercise the installed CLI with explicit arguments.
-            ["/bin/bash", "-c", '"$0" -m landing "$@" || exit', sys.executable, *arguments],
-            capture_output=True,
-            text=True,
-            env=environment,
-            check=False,
-        )
-        assert result.returncode == status
-        assert "\x1b[" not in result.stdout + result.stderr
-        if status:
-            assert not result.stdout
-            assert "--limit" in result.stderr
-        elif "--show-completion" in arguments:
-            assert "_LANDING_COMPLETE" in result.stdout
-        else:
-            assert "--help" in result.stdout
+        pytest.skip("Typer cannot detect the calling shell in this environment.")
+    result = run_in_shell("-m", "landing", *arguments)
+    assert result.returncode == status
+    assert "\x1b[" not in result.stdout + result.stderr
+    if status:
+        assert not result.stdout
+        assert "--limit" in result.stderr
+    elif "--show-completion" in arguments:
+        assert "_LANDING_COMPLETE" in result.stdout
+    else:
+        assert "--help" in result.stdout
 
 
 @pytest.mark.parametrize("native_host", [False, True])
