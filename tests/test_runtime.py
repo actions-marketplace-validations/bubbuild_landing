@@ -2,7 +2,6 @@ import asyncio
 import os
 
 import pytest
-from bub import BubFramework
 
 from landing.cli import main
 from landing.database import open_database
@@ -163,7 +162,7 @@ def test_second_worker_cannot_interrupt_live_work(tmp_path, model, native_host):
             await asyncio.Event().wait()
 
         responses.append(blocked)
-        owner = Runtime(path, framework=BubFramework())
+        owner = Runtime(path)
         async with owner.framework.running() if native_host else owner.running():
             task = asyncio.create_task(owner.run(ActionRequest(mode="explainer", instruction="Explain the failure.")))
             await asyncio.wait_for(started.wait(), 5)

@@ -7,7 +7,7 @@ readme = "README.md"
 keywords = ['python']
 requires-python = ">=3.12,<4.0"
 dependencies = [
-    "bub==0.5.0",
+    "bub[app]==0.6.0a3",
     "bub-mcp==0.3.0",
     "fastapi>=0.132",
     "pydantic>=2.12",
@@ -31,9 +31,6 @@ classifiers = [
 [project.scripts]
 landing = "landing.cli:main"
 
-[project.entry-points."landing.adapters"]
-landing-github = "landing.adapters.github"
-
 [project.urls]
 Homepage = "https://getlanding.dev/"
 Repository = "https://github.com/bubbuild/landing"
@@ -42,6 +39,7 @@ Documentation = "https://getlanding.dev/"
 [dependency-groups]
 dev = [
     "httpx>=0.28",
+    "httpx2>=2.14",
     "pytest>=9.0.2",
     "pre-commit>=4.5.1",
     "tox-uv>=1.33.4",
